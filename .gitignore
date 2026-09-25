@@ -1,0 +1,18 @@
+# Data files (GitHub 100MB file size limit)
+*.zip
+*.tsv
+*.csv
+*.parquet
+student_resource/dataset/train/*.tsv
+student_resource/dataset/test/*.tsv
+
+# OS & Environment
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+env/
+venv/
+output/
