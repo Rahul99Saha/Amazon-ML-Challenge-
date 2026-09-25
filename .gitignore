@@ -1,0 +1,12 @@
+.venv/
+Dataset/
+data
+work/
+output/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.parquet
+*.npy
+*.faiss
+*.zip
