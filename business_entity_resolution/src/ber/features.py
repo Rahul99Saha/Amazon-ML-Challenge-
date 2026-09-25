@@ -83,7 +83,10 @@ def _idf_overlap(x: pl.DataFrame, tok_idf: pl.DataFrame) -> pl.Series:
     return (r["num"] / r["den"]).fill_null(0).cast(pl.Float32).alias("n_idf_cover")
 
 
-FEATURES = [
+NG_FIELDS = ["name", "name_addr"]
+NG_FEATURES = [f"ng_{f}" for f in NG_FIELDS] + [f"ng_{f}_rank" for f in NG_FIELDS] + ["from_keys", "from_ng"]
+
+FEATURES = NG_FEATURES + [
     "block_score", "block_rank", "bk_name", "bk_compact", "bk_addr", "bk_addrword",
     "bk_namepair", "bk_addrpair", "bk_nameaddr", "bk_compact10",
     "n_ratio", "n_tset", "n_tsort", "n_partial", "n_jw", "n_alt_tset", "a_ratio", "a_tset",

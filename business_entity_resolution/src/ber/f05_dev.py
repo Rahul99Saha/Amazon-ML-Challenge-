@@ -10,8 +10,8 @@ from ber.metric import macro_f05
 
 
 def main() -> None:
-    ev = pl.read_parquet(WORK / "dev_feats_eval.parquet")
-    booster = lgb.Booster(model_file=str(WORK / "reranker_dev.txt"))
+    ev = pl.read_parquet(WORK / "dev_feats_eval_bm25.parquet")
+    booster = lgb.Booster(model_file=str(WORK / "reranker.txt"))
     ev = ev.with_columns(prob=pl.Series(booster.predict(ev.select(FEATURES).to_numpy()).astype(np.float32)))
     # Evaluation universe = the 20k held-out queries (same shuffle as rerank_dev).
     all_q = pl.read_parquet(WORK / "train_s1.parquet", columns=["idx"])["idx"].shuffle(seed=42)
