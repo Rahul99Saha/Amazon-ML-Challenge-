@@ -24,6 +24,7 @@ from ber.context import CONTEXT_FEATURES, add_context, competition
 from ber.decide import expected_f05_sets, one_to_one
 from ber.features import FEATURES
 from ber.io import WORK, is_ce_query
+from ber.log import Progress, get, timed
 from ber.metric import macro_f05
 
 BASE_FEATURES = FEATURES + [f for f in CONTEXT_FEATURES if f not in FEATURES]
@@ -33,6 +34,7 @@ PARAMS = dict(
     verbose=-1, num_threads=8,
 )
 DECISION = WORK / "decision.json"
+log = get("matcher")
 
 
 def has_ce(split: str) -> bool:
@@ -47,8 +49,10 @@ def build_ctx(split: str, q_chunk: int = 100_000) -> None:
     src, dst = WORK / f"{split}_cand.parquet", WORK / f"{split}_ctx.parquet"
     slim = pl.read_parquet(src, columns=["q_idx", "p_idx", "rr_prob"])
     qs = slim["q_idx"].unique().sort()
-    claims = competition(slim)
+    with timed(log, f"{split}: competition features over {slim.height:,} pairs"):
+        claims = competition(slim)
     del slim
+    prog = Progress(log, f"{split} context features (queries)", len(qs))
     parts = []
     for i, s in enumerate(range(0, len(qs), q_chunk)):
         ids = qs.slice(s, q_chunk)
@@ -57,6 +61,7 @@ def build_ctx(split: str, q_chunk: int = 100_000) -> None:
         part = dst.with_suffix(f".part{i}.parquet")
         c.write_parquet(part)
         parts.append(part)
+        prog.step(len(ids))
     pl.concat([pl.scan_parquet(x) for x in parts]).sink_parquet(dst)
     for x in parts:
         x.unlink()
@@ -76,15 +81,19 @@ def _rows(split: str, q_ids: pl.Series) -> pl.DataFrame:
 
 def _train(df: pl.DataFrame, feats: list[str], rounds: int) -> lgb.Booster:
     ds = lgb.Dataset(df.select(feats).to_numpy(np.float32), df["label"].to_numpy(), free_raw_data=True)
-    return lgb.train(PARAMS, ds, num_boost_round=rounds)
+    log.info(f"LightGBM: {df.height:,} pairs, {len(feats)} features, {rounds} rounds, positives {df['label'].mean():.3f}")
+    return lgb.train(PARAMS, ds, num_boost_round=rounds,
+                     callbacks=[lgb.log_evaluation(100)], valid_sets=[ds], valid_names=["train"])
 
 
 def _predict(booster: lgb.Booster, split: str, q_ids: pl.Series, chunk: int = 200_000) -> pl.DataFrame:
     feats, outs = features(split), []
+    prog = Progress(log, f"{split} predict (queries)", len(q_ids))
     for s in range(0, len(q_ids), chunk):
         c = _rows(split, q_ids.slice(s, chunk))
         p = booster.predict(c.select(feats).to_numpy(np.float32)).astype(np.float32)
         outs.append(c.select("q_idx", "p_idx").with_columns(prob=pl.Series(p)))
+        prog.step(min(chunk, len(q_ids) - s))
     return pl.concat(outs)
 
 
@@ -116,10 +125,11 @@ def oof(n_train_q: int, rounds: int) -> None:
     preds = []
     for k in (0, 1):
         t = time.time()
+        log.info(f"fold {k}: training on other fold, predicting {int((fold == k).sum()):,} queries")
         tr_q = good.filter(good.is_in(all_q.filter(fold != k).implode()))
         booster = _train(_training_rows(tr_q, n_train_q, seed=k), features("train"), rounds)
         preds.append(_predict(booster, "train", all_q.filter(fold == k)))
-        print(f"fold {k}: {time.time() - t:.0f}s", flush=True)
+        log.info(f"fold {k}: {time.time() - t:.0f}s")
         if k == 0:
             imp = sorted(zip(booster.feature_importance("gain"), features("train")), reverse=True)[:20]
             print("top features:", [f for _, f in imp])

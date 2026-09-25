@@ -17,6 +17,8 @@ full query x pool matrix) and features (score for any pair, whichever channel fo
 it). N-grams in more than `max_df` pool records are dropped: their idf is ~0 so ranking
 barely changes, but their posting lists dominate the cost.
 """
+import time
+
 import numpy as np
 import polars as pl
 from scipy import sparse
@@ -25,6 +27,9 @@ from sparse_dot_topn import sp_matmul_topn
 
 from ber.features import NG_FIELDS
 from ber.io import WORK
+from ber.log import get, timed
+
+log = get("ngram")
 
 FIELDS = {
     # spaces removed: "safe marine" / "safemarine.com" / "#SAFEMARINE" all share 3-grams
@@ -91,11 +96,14 @@ class NgramIndex:
         self.p_ids = pool["idx"].to_numpy()
         self.p_row = pl.DataFrame({"p_idx": pool["idx"], "p_row": np.arange(pool.height, dtype=np.int64)})
         self.w, self.P, self.PT = {}, {}, {}
+        log.info(f"{country}: {pool.height:,} pool records, fields {self.fields}, weighting {weighting}")
         for f in self.fields:
-            w = make_weighting(weighting, **kw)
-            self.P[f] = w.fit_transform(pool[f].to_list())
-            self.PT[f] = sparse.csr_matrix(self.P[f].T)
-            self.w[f] = w
+            with timed(log, f"{country}: fit {weighting} on '{f}'"):
+                w = make_weighting(weighting, **kw)
+                self.P[f] = w.fit_transform(pool[f].to_list())
+                self.PT[f] = sparse.csr_matrix(self.P[f].T)
+                self.w[f] = w
+            log.info(f"{country} '{f}': vocab {self.P[f].shape[1]:,} n-grams, {self.P[f].nnz:,} non-zeros")
 
     def _queries(self, q_ids: pl.Series) -> pl.DataFrame:
         return (
@@ -110,8 +118,10 @@ class NgramIndex:
         q = self._queries(q_ids)
         outs = []
         for f in self.fields:
+            t = time.time()
             Q = self.w[f].queries(q[f].to_list())
             R = sp_matmul_topn(Q, self.PT[f], top_n=top_k, threshold=min_score, n_threads=threads).tocoo()
+            log.info(f"top-{top_k} '{f}': {q.height:,} queries -> {R.nnz:,} pairs ({time.time() - t:.0f}s)")
             outs.append(pl.DataFrame({"q_idx": q["idx"].to_numpy()[R.row], "p_idx": self.p_ids[R.col]}))
         return pl.concat(outs).unique()
 

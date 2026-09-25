@@ -17,7 +17,7 @@ from ber.normalize import normalize
 def prepare_split(split: str) -> None:
     WORK.mkdir(exist_ok=True)
     tmap = translit.load()
-    print(f"translit mappings: {len(tmap):,}")
+    print(f"translit mappings: {len(tmap):,}", flush=True)
     t = time.time()
     s1 = normalize(load_source(split, 1), tmap).with_row_index("idx")
     s1.write_parquet(WORK / f"{split}_s1.parquet")
@@ -51,7 +51,7 @@ def prepare_gt() -> None:
     )
     assert pairs.height == gt.drop_nulls("match").height, "unmapped ground-truth ids"
     pairs.write_parquet(WORK / "train_gt_pairs.parquet")
-    print(f"gt pairs {pairs.height:,}")
+    print(f"gt pairs {pairs.height:,}", flush=True)
 
 
 if __name__ == "__main__":
@@ -65,6 +65,6 @@ if __name__ == "__main__":
         if not translit.PATH.exists():
             # Dictionary is learned from the first normalised pass; re-run to apply it.
             translit.learn()
-            print("learned transliteration map; re-running normalisation with it")
+            print("learned transliteration map; re-running normalisation with it", flush=True)
             for sp in args.splits:
                 prepare_split(sp)

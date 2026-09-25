@@ -11,9 +11,14 @@ the 10M-record pool never needs to be materialised with its string columns.
 """
 from pathlib import Path
 
+import time
+
 import polars as pl
 
 from ber.io import WORK
+from ber.log import Progress, get, timed
+
+log = get("blocking")
 
 KINDS = ["name", "compact", "addr", "addrword", "namepair", "addrpair", "nameaddr", "compact10"]
 KEY_COLS = ["idx", "country", "name_core_tokens", "name_alt", "name_compact", "addr_words", "addr_nums"]
@@ -162,8 +167,9 @@ def generate_candidates(
     if not wdf_path.exists():
         word_df(pool_path).write_parquet(wdf_path)
     wdf = pl.read_parquet(wdf_path)
-    pk_path = build_keys(pool_path, WORK / f"{split}_pool_keys.parquet", wdf)
-    qk_path = build_keys(WORK / f"{split}_s1.parquet", WORK / f"{split}_s1_keys.parquet", wdf)
+    with timed(log, "pool/S1 keys (built once, cached)"):
+        pk_path = build_keys(pool_path, WORK / f"{split}_pool_keys.parquet", wdf)
+        qk_path = build_keys(WORK / f"{split}_s1.parquet", WORK / f"{split}_s1_keys.parquet", wdf)
 
     n_pool = pl.scan_parquet(pool_path).select(pl.len()).collect().item()
     kw = pl.DataFrame(
@@ -174,8 +180,10 @@ def generate_candidates(
     if q_idx is not None:
         qk = qk.filter(pl.col("idx").is_in(q_idx.implode()))
     qk = qk.collect(engine="streaming")
+    log.info(f"query keys: {qk.height:,}")
     # Pass 1 (streaming, never materialises pool rows): block size of each query key.
     # Pass 2: load pool rows only for keys small enough to keep.
+    t_pass = time.time()
     bsize = (
         pl.scan_parquet(pk_path)
         .join(qk.select("key").unique().lazy(), on="key", how="semi")
@@ -185,16 +193,20 @@ def generate_candidates(
         .select("key", "idf")
         .collect(engine="streaming")
     )
+    log.info(f"pass 1: {bsize.height:,} keys with block size <= {max_block} ({time.time() - t_pass:.0f}s)")
+    t_pass = time.time()
     pk = (
         pl.scan_parquet(pk_path)
         .join(bsize.lazy(), on="key")
         .select("key", "idx", "idf")
         .collect(engine="streaming")
     )
+    log.info(f"pass 2: {pk.height:,} pool key rows loaded ({time.time() - t_pass:.0f}s)")
     qk = qk.join(bsize.select("key"), on="key")
     del bsize
 
     q_ids = qk["idx"].unique().sort()
+    prog = Progress(log, "key-index scoring (queries)", len(q_ids))
     outs = []
     for start in range(0, len(q_ids), chunk):
         ids = q_ids.slice(start, chunk)
@@ -213,4 +225,5 @@ def generate_candidates(
             .with_columns(block_rank=pl.int_range(pl.len()).over("idx").cast(pl.UInt16))
         )
         outs.append(pairs)
+        prog.step(len(ids))
     return pl.concat(outs).rename({"idx": "q_idx", "idx_p": "p_idx"})

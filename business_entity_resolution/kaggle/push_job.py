@@ -52,7 +52,7 @@ for root, _, files in os.walk("/kaggle/input", followlinks=True):
         if not os.path.exists(dst):
             os.symlink(os.path.join(root, fn), dst); links.append(dst)
 env = dict(os.environ, PYTHONPATH=code, BER_DATA=data, BER_WORK=work,
-           BER_OUTPUT="/kaggle/working/output", POLARS_MAX_THREADS="4")
+           BER_OUTPUT="/kaggle/working/output", POLARS_MAX_THREADS="4", PYTHONUNBUFFERED="1")
 print("code", code, "| data", data, "| linked", len(links), "files", flush=True)
 ok = True
 for s in STEPS:

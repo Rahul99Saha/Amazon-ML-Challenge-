@@ -15,7 +15,10 @@ import polars as pl
 from ber.candidates import RERANKER, featurize, token_idf, union_candidates
 from ber.features import FEATURES
 from ber.io import WORK
+from ber.log import get, timed
 from ber.ngram import NgramIndex
+
+log = get("rerank")
 
 
 def build(q_sets: dict[str, pl.Series], block_k: int, ng_k: int, weighting: str) -> dict[str, pl.DataFrame]:
@@ -26,13 +29,15 @@ def build(q_sets: dict[str, pl.Series], block_k: int, ng_k: int, weighting: str)
     parts = {k: [] for k in q_sets}
     for ctry in sorted(country["country"].unique().to_list()):
         in_c = country.filter(pl.col("country") == ctry)["idx"]
-        ng = NgramIndex("train", ctry, weighting=weighting)
+        with timed(log, f"{ctry}: fit n-gram index"):
+            ng = NgramIndex("train", ctry, weighting=weighting)
         for name, qs in q_sets.items():
             q = qs.filter(qs.is_in(in_c.implode()))
             if len(q) == 0:
                 continue
+            log.info(f"{ctry}: {name} set, {len(q):,} queries")
             cand = union_candidates("train", q, ng, block_k, ng_k)
-            for f in featurize("train", cand, ng, tok_idf):
+            for f in featurize("train", cand, ng, tok_idf, label=f"{ctry} {name} features"):
                 parts[name].append(
                     f.join(gt, on=["q_idx", "p_idx"], how="left").with_columns(pl.col("label").fill_null(0))
                 )
@@ -86,7 +91,8 @@ def main() -> None:
         n_estimators=400, learning_rate=0.08, num_leaves=63, min_child_samples=50,
         subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1,
     )
-    model.fit(tr.select(FEATURES).to_numpy(), tr["label"].to_numpy())
+    with timed(log, f"train re-ranker on {tr.height:,} pairs"):
+        model.fit(tr.select(FEATURES).to_numpy(), tr["label"].to_numpy())
     print("re-ranker:")
     recall_at(ev, model.predict_proba(ev.select(FEATURES).to_numpy())[:, 1], gt_ev)
     imp = sorted(zip(model.booster_.feature_importance("gain"), FEATURES), reverse=True)[:15]
