@@ -39,8 +39,11 @@ Text. Unlike ngram.py's character-3-gram fields, spaces are kept: a transformer 
 into words/subwords, so gluing the name into one token (as the n-gram channel does for
 website-style names) would only hurt it here.
 """
+import json
 import os
 import sys
+import time
+from pathlib import Path
 
 # faiss (libomp) and torch (libiomp5/MKL) each bundle their own OpenMP runtime. Loading
 # both in one process aborts on macOS ("OMP: Error #179") or segfaults intermittently
@@ -110,19 +113,14 @@ class EmbeddingIndex:
             cache = WORK / f"emb_{_model_slug(model_name)}_{split}_{ctry_slug}_{f}.npy"
             if cache.exists():
                 log.info(f"{country} '{f}': loading cached embeddings from {cache.name}")
-                vecs = np.load(cache)
+                vecs = np.load(cache, mmap_mode="r")
                 assert vecs.shape[0] == pool.height, (
                     f"{cache}: cached {vecs.shape[0]:,} vectors but pool has {pool.height:,} records "
                     "(stale cache from a different data version?)"
                 )
             else:
                 with timed(log, f"{country}: encode '{f}' ({pool.height:,} records)"):
-                    vecs = self._encode(pool[f].to_list())
-                # np.save silently appends ".npy" to any name that doesn't already end in
-                # it, so the temp name must end in ".npy" too or the later rename misses.
-                tmp = cache.with_name(cache.stem + ".tmp.npy")
-                np.save(tmp, vecs)
-                tmp.rename(cache)  # atomic: a killed process never leaves a corrupt cache file
+                    vecs = self._encode_pool(pool[f].to_list(), cache)
             import faiss
             if _IS_MACOS:
                 faiss.omp_set_num_threads(1)  # env var alone isn't always honoured; see note above
@@ -137,6 +135,54 @@ class EmbeddingIndex:
             texts, batch_size=self.batch_size, convert_to_numpy=True,
             normalize_embeddings=True, show_progress_bar=False,
         ).astype(np.float32)
+
+    def _encode_pool(self, texts: list[str], cache: Path, chunk: int = 200_000) -> np.ndarray:
+        """Encodes a whole country pool field in resumable chunks, logging every 10%.
+
+        Writes directly into an on-disk memmap (`cache`'s ".partial.npy") and records
+        progress (".progress.json") after every chunk, both via atomic tmp+rename. A
+        crash mid-encode therefore loses at most one chunk (~a minute or two of GPU time
+        at this chunk size), not the whole field: __init__ only ever calls this when the
+        *finished* cache file is missing, and a restart resumes from the last checkpoint
+        rather than row 0.
+        """
+        n = len(texts)
+        # renamed get_embedding_dimension in newer sentence-transformers; support both
+        dim = (self.model.get_embedding_dimension if hasattr(self.model, "get_embedding_dimension")
+               else self.model.get_sentence_embedding_dimension)()
+        progress = cache.with_name(cache.stem + ".progress.json")
+        partial = cache.with_name(cache.stem + ".partial.npy")
+
+        done = 0
+        if progress.exists() and partial.exists():
+            state = json.loads(progress.read_text())
+            if state.get("n") == n and state.get("dim") == dim:
+                done = state["done"]
+                log.info(f"{cache.stem}: resuming from checkpoint {done:,}/{n:,} ({100 * done / max(n, 1):.0f}%)")
+            else:
+                log.info(f"{cache.stem}: stale checkpoint (shape changed) -- restarting from 0")
+
+        mm = np.lib.format.open_memmap(partial, mode=("r+" if done else "w+"), dtype=np.float32, shape=(n, dim))
+        next_pct = (int(100 * done / max(n, 1)) // 10 + 1) * 10
+        t0 = time.time()
+        for s in range(done, n, chunk):
+            e = min(s + chunk, n)
+            mm[s:e] = self._encode(texts[s:e])
+            mm.flush()
+            done = e
+            tmp = progress.with_name(progress.stem + ".tmp" + progress.suffix)
+            tmp.write_text(json.dumps({"n": n, "dim": dim, "done": done}))
+            tmp.rename(progress)
+            pct = 100 * done / max(n, 1)
+            while next_pct <= pct and next_pct <= 100:
+                rate = done / (time.time() - t0) if time.time() > t0 else 0.0
+                eta_min = (n - done) / rate / 60 if rate > 0 else float("nan")
+                log.info(f"{cache.stem}: {next_pct}% ({done:,}/{n:,})  {rate:.0f} rec/s  ETA {eta_min:.0f}m")
+                next_pct += 10
+        del mm
+        partial.rename(cache)
+        progress.unlink(missing_ok=True)
+        return np.load(cache, mmap_mode="r")
 
     def _queries(self, q_ids: pl.Series) -> pl.DataFrame:
         return (
