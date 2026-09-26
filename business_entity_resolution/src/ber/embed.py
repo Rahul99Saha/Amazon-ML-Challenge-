@@ -131,11 +131,15 @@ class EmbeddingIndex:
             cache = WORK / f"emb_{model_slug}_{split}_{ctry_slug}_{f}.npy"
             if cache.exists():
                 log.info(f"{country} '{f}': loading cached embeddings from {cache.name}")
-                vecs = np.load(cache, mmap_mode="r")
-                assert vecs.shape[0] == pool.height, (
-                    f"{cache}: cached {vecs.shape[0]:,} vectors but pool has {pool.height:,} records "
-                    "(stale cache from a different data version?)"
+                # Not a real .npy (no header) -- see _encode_pool's finalize step for why.
+                dim = self._get_dim()
+                expected = pool.height * dim * 4
+                actual = cache.stat().st_size
+                assert actual == expected, (
+                    f"{cache}: {actual} bytes on disk, expected {expected} for {pool.height:,} x {dim} "
+                    "float32 (stale cache from a different data version?)"
                 )
+                vecs = np.memmap(cache, dtype=np.float32, mode="r").reshape(pool.height, dim)
             else:
                 self._make_room(pool.height, keep_stem=cache.stem)
                 with timed(log, f"{country}: encode '{f}' ({pool.height:,} records)"):
@@ -224,8 +228,17 @@ class EmbeddingIndex:
         real run: the just-finished field's cache plus the next field's pre-allocated,
         still-empty file together exceeded it). Progress (".progress.json") is written
         after every chunk via atomic tmp+rename, so a crash resumes from the last
-        checkpoint. The finished file becomes a normal .npy via a streamed header+copy
-        that never materialises the whole array to do it.
+        checkpoint.
+
+        The finished file is the completed ".partial.raw" itself, just renamed -- not
+        wrapped in a real .npy (no header). A rename is instant and needs no extra disk;
+        the previous version instead streamed a header+copy into a *second* full-size
+        file before deleting the source, which needs the completed raw file (its full
+        ~15GB) AND the growing copy to coexist simultaneously -- exactly what crashed a
+        real run right as a field finished encoding, immediately after eviction had freed
+        just enough room for the raw file alone. n/dim are always known independently
+        (pool size, model dimension) at load time, so no embedded shape metadata is
+        needed; callers reshape a plain memmap themselves.
         """
         n, dim = len(texts), self._get_dim()
         progress = cache.with_name(cache.stem + ".progress.json")
@@ -246,6 +259,7 @@ class EmbeddingIndex:
         else:
             raw.unlink(missing_ok=True)
 
+        start_done = done
         next_pct = (int(100 * done / max(n, 1)) // 10 + 1) * 10
         t0 = time.time()
         with open(raw, "ab" if done else "wb") as f:
@@ -260,19 +274,18 @@ class EmbeddingIndex:
                 tmp.rename(progress)
                 pct = 100 * done / max(n, 1)
                 while next_pct <= pct and next_pct <= 100:
-                    rate = done / (time.time() - t0) if time.time() > t0 else 0.0
+                    # rate/ETA cover only what THIS call has processed (done - start_done):
+                    # on a resume, done already includes the prior session's rows, which
+                    # would otherwise make the rate look many times too fast.
+                    elapsed = time.time() - t0
+                    rate = (done - start_done) / elapsed if elapsed > 0 else 0.0
                     eta_min = (n - done) / rate / 60 if rate > 0 else float("nan")
                     log.info(f"{cache.stem}: {next_pct}% ({done:,}/{n:,})  {rate:.0f} rec/s  ETA {eta_min:.0f}m")
                     next_pct += 10
 
-        tmp_npy = cache.with_name(cache.stem + ".tmp.npy")
-        with open(tmp_npy, "wb") as out, open(raw, "rb") as inp:
-            np.lib.format.write_array_header_1_0(out, {"descr": "<f4", "fortran_order": False, "shape": (n, dim)})
-            shutil.copyfileobj(inp, out, length=64 * 1024 * 1024)
-        tmp_npy.rename(cache)
-        raw.unlink()
+        raw.rename(cache)
         progress.unlink(missing_ok=True)
-        return np.load(cache, mmap_mode="r")
+        return np.memmap(cache, dtype=np.float32, mode="r").reshape(n, dim)
 
     def _queries(self, q_ids: pl.Series) -> pl.DataFrame:
         return (
