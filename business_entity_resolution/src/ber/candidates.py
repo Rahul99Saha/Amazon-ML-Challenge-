@@ -22,13 +22,20 @@ import polars as pl
 
 from ber.blocking import KINDS, generate_candidates
 from ber.embed import DEFAULT_MODEL, EmbeddingIndex
-from ber.features import EMB_FIELDS, FEATURES, REC_COLS, attach_records, name_token_idf, pair_features
+from ber.features import FEATURES, FEATURES_EMB, REC_COLS, attach_records, name_token_idf, pair_features
 from ber.io import WORK
 from ber.log import Progress, get, timed
 from ber.ngram import NgramIndex
 
 RERANKER = WORK / "reranker.txt"
 log = get("cand")
+
+
+def reranker_path(weighting: str, embed: bool):
+    """Matches rerank_dev.py's save path: reranker.txt only for the original
+    (bm25, no embedding) config, so existing runs/artifacts are untouched by default."""
+    tag = weighting + ("_emb" if embed else "")
+    return RERANKER if tag == "bm25" else WORK / f"reranker_{tag}.txt"
 
 
 def union_candidates(split: str, q_ids: pl.Series, ng: NgramIndex, block_k: int, ng_k: int,
@@ -72,14 +79,11 @@ def featurize(split: str, cand: pl.DataFrame, ng: NgramIndex, tok_idf: pl.DataFr
         c = cand.filter(pl.col("q_idx").is_in(q_ids.slice(s, chunk).implode()))
         n_pairs = c.height
         c = ng.pair_features(c)
+        feats = FEATURES
         if emb is not None:
             c = emb.pair_features(c)
-        else:
-            c = c.with_columns(
-                *[pl.lit(0.0, pl.Float32).alias(f"emb_{f}") for f in EMB_FIELDS],
-                *[pl.lit(65535, pl.UInt16).alias(f"emb_{f}_rank") for f in EMB_FIELDS],
-            )
-        yield pair_features(attach_records(c, q, p), tok_idf).select(["q_idx", "p_idx", *FEATURES])
+            feats = FEATURES_EMB
+        yield pair_features(attach_records(c, q, p), tok_idf).select(["q_idx", "p_idx", *feats])
         prog.step(min(chunk, len(q_ids) - s), pairs=f"{n_pairs:,}")
 
 
@@ -110,7 +114,10 @@ def run(split: str, block_k: int, ng_k: int, keep_k: int, super_chunk: int, weig
              f"embed={embed}" + (f" embed_model={embed_model} emb_k={emb_k}" if embed else ""))
     with timed(log, "name-token idf"):
         tok_idf = token_idf(split)
-    booster = lgb.Booster(model_file=str(RERANKER))
+    rr_path = reranker_path(weighting, embed)
+    feats = FEATURES_EMB if embed else FEATURES
+    log.info(f"loading re-ranker {rr_path} ({len(feats)} features)")
+    booster = lgb.Booster(model_file=str(rr_path))
     s1 = pl.read_parquet(WORK / f"{split}_s1.parquet", columns=["idx", "country"])
     for ctry in sorted(s1["country"].unique().to_list()):
         if countries and ctry not in countries:
@@ -137,7 +144,7 @@ def run(split: str, block_k: int, ng_k: int, keep_k: int, super_chunk: int, weig
             cand = union_candidates(split, q_ids, ng, block_k, ng_k, emb=emb, emb_k=emb_k)
             kept = []
             for f in featurize(split, cand, ng, tok_idf, emb=emb, label=f"{ctry} sc{k + 1}/{len(todo)} features"):
-                f = f.with_columns(rr_prob=pl.Series(booster.predict(f.select(FEATURES).to_numpy()).astype(np.float32)))
+                f = f.with_columns(rr_prob=pl.Series(booster.predict(f.select(feats).to_numpy()).astype(np.float32)))
                 f = f.with_columns(rr_rank=pl.col("rr_prob").rank("ordinal", descending=True).over("q_idx").cast(pl.UInt16))
                 kept.append(f.filter(pl.col("rr_rank") <= keep_k))
             out = pl.concat(kept)

@@ -6,15 +6,14 @@ them from matcher training/evaluation because their re-ranker scores are optimis
 """
 import argparse
 import time
-from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
 import polars as pl
 
-from ber.candidates import RERANKER, featurize, token_idf, union_candidates
+from ber.candidates import featurize, reranker_path, token_idf, union_candidates
 from ber.embed import DEFAULT_MODEL, EmbeddingIndex
-from ber.features import FEATURES
+from ber.features import FEATURES, FEATURES_EMB
 from ber.io import WORK
 from ber.log import get, timed
 from ber.ngram import NgramIndex
@@ -73,6 +72,7 @@ def main() -> None:
     ap.add_argument("--emb-k", type=int, default=50)
     a = ap.parse_args()
     tag = a.weighting + ("_emb" if a.embed else "")
+    feats = FEATURES_EMB if a.embed else FEATURES
 
     all_q = pl.read_parquet(WORK / "train_s1.parquet", columns=["idx"])["idx"].shuffle(seed=42)
     q_tr, q_ev = all_q.slice(0, a.n_train), all_q.slice(a.n_train, a.n_eval)
@@ -109,13 +109,14 @@ def main() -> None:
         subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1,
     )
     with timed(log, f"train re-ranker on {tr.height:,} pairs"):
-        model.fit(tr.select(FEATURES).to_numpy(), tr["label"].to_numpy())
+        model.fit(tr.select(feats).to_numpy(), tr["label"].to_numpy())
     print("re-ranker:")
-    recall_at(ev, model.predict_proba(ev.select(FEATURES).to_numpy())[:, 1], gt_ev)
-    imp = sorted(zip(model.booster_.feature_importance("gain"), FEATURES), reverse=True)[:15]
+    recall_at(ev, model.predict_proba(ev.select(feats).to_numpy())[:, 1], gt_ev)
+    imp = sorted(zip(model.booster_.feature_importance("gain"), feats), reverse=True)[:15]
     print("top features:", [f for _, f in imp])
-    path = RERANKER if tag == "bm25" else Path(str(RERANKER).replace(".txt", f"_{tag}.txt"))
+    path = reranker_path(a.weighting, a.embed)
     model.booster_.save_model(str(path))
+    print(f"saved re-ranker to {path}")
 
 
 if __name__ == "__main__":

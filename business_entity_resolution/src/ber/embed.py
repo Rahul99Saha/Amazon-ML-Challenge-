@@ -82,6 +82,10 @@ def _get_model(model_name: str, device: str | None):
     return _MODEL_CACHE[key]
 
 
+def _model_slug(model_name: str) -> str:
+    return model_name.replace("/", "__")
+
+
 class EmbeddingIndex:
     def __init__(self, split: str, country: str, fields=EMB_FIELDS, model_name: str = DEFAULT_MODEL,
                  batch_size: int = 256, device: str | None = None):
@@ -95,19 +99,38 @@ class EmbeddingIndex:
         )
         self.p_ids = pool["idx"].to_numpy()
         self.p_row = pl.DataFrame({"p_idx": pool["idx"], "p_row": np.arange(pool.height, dtype=np.int64)})
-        self.index, self.P = {}, {}
+        self.index = {}
         log.info(f"{country}: {pool.height:,} pool records, fields {self.fields}, model {model_name}")
+        ctry_slug = country.replace(" ", "_")
         for f in self.fields:
-            with timed(log, f"{country}: encode '{f}' ({pool.height:,} records)"):
-                vecs = self._encode(pool[f].to_list())
-            self.P[f] = vecs
+            # The pool encode is the expensive, slow step (minutes to hours per field on a
+            # multi-million-record country pool) and everything here otherwise lives only
+            # in memory, so a crashed/killed/disconnected session loses all of it. Caching
+            # each finished field to disk means a restart resumes instead of re-encoding.
+            cache = WORK / f"emb_{_model_slug(model_name)}_{split}_{ctry_slug}_{f}.npy"
+            if cache.exists():
+                log.info(f"{country} '{f}': loading cached embeddings from {cache.name}")
+                vecs = np.load(cache)
+                assert vecs.shape[0] == pool.height, (
+                    f"{cache}: cached {vecs.shape[0]:,} vectors but pool has {pool.height:,} records "
+                    "(stale cache from a different data version?)"
+                )
+            else:
+                with timed(log, f"{country}: encode '{f}' ({pool.height:,} records)"):
+                    vecs = self._encode(pool[f].to_list())
+                # np.save silently appends ".npy" to any name that doesn't already end in
+                # it, so the temp name must end in ".npy" too or the later rename misses.
+                tmp = cache.with_name(cache.stem + ".tmp.npy")
+                np.save(tmp, vecs)
+                tmp.rename(cache)  # atomic: a killed process never leaves a corrupt cache file
             import faiss
             if _IS_MACOS:
                 faiss.omp_set_num_threads(1)  # env var alone isn't always honoured; see note above
             idx = faiss.IndexFlatIP(vecs.shape[1])
-            idx.add(vecs)
-            self.index[f] = idx
+            idx.add(vecs)  # FAISS copies vecs into its own storage; we deliberately don't
+            self.index[f] = idx  # keep a second copy (see _reconstruct) -- that copy is what OOM'd
             log.info(f"{country} '{f}': {vecs.shape[0]:,} vectors, dim {vecs.shape[1]}")
+            del vecs
 
     def _encode(self, texts: list[str]) -> np.ndarray:
         return self.model.encode(
@@ -137,6 +160,14 @@ class EmbeddingIndex:
             outs.append(pl.DataFrame({"q_idx": q["idx"].to_numpy()[rows[keep]], "p_idx": self.p_ids[cols[keep]]}))
         return pl.concat(outs).unique()
 
+    def _reconstruct(self, f: str, rows: np.ndarray) -> np.ndarray:
+        """Pulls specific pool vectors back out of the FAISS index (see __init__: we don't
+        keep a second copy of the full pool matrix around just for this)."""
+        idx = self.index[f]
+        if hasattr(idx, "reconstruct_batch"):
+            return idx.reconstruct_batch(rows.astype(np.int64))
+        return np.stack([idx.reconstruct(int(i)) for i in rows])
+
     def pair_features(self, pairs: pl.DataFrame) -> pl.DataFrame:
         """Adds emb_<field> cosine score and emb_<field>_rank (within query) for every pair."""
         q = self._queries(pairs["q_idx"].unique())
@@ -146,7 +177,7 @@ class EmbeddingIndex:
         cols = {}
         for f in self.fields:
             Qv = self._encode(q[f].to_list())
-            cols[f"emb_{f}"] = np.einsum("ij,ij->i", Qv[qi], self.P[f][pj]).astype(np.float32)
+            cols[f"emb_{f}"] = np.einsum("ij,ij->i", Qv[qi], self._reconstruct(f, pj)).astype(np.float32)
         x = x.drop("q_row", "p_row").with_columns([pl.Series(k, v) for k, v in cols.items()])
         return x.with_columns(
             [pl.col(f"emb_{f}").rank("ordinal", descending=True).over("q_idx").cast(pl.UInt16).alias(f"emb_{f}_rank")

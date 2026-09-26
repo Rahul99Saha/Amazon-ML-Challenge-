@@ -89,7 +89,12 @@ NG_FEATURES = [f"ng_{f}" for f in NG_FIELDS] + [f"ng_{f}_rank" for f in NG_FIELD
 EMB_FIELDS = ["name", "name_addr"]
 EMB_FEATURES = [f"emb_{f}" for f in EMB_FIELDS] + [f"emb_{f}_rank" for f in EMB_FIELDS] + ["from_emb"]
 
-FEATURES = NG_FEATURES + EMB_FEATURES + [
+# FEATURES must stay exactly what it was before the embedding channel existed: it's the
+# schema every already-trained reranker.txt / matcher.txt on disk was fit on, and
+# LightGBM's predict() requires an exact column-count match. Runs that don't pass
+# --embed (the default) must keep working against those existing models untouched.
+# FEATURES_EMB is the opt-in superset, paired with its own reranker_bm25_emb.txt.
+FEATURES = NG_FEATURES + [
     "block_score", "block_rank", "bk_name", "bk_compact", "bk_addr", "bk_addrword",
     "bk_namepair", "bk_addrpair", "bk_nameaddr", "bk_compact10",
     "n_ratio", "n_tset", "n_tsort", "n_partial", "n_jw", "n_alt_tset", "a_ratio", "a_tset",
@@ -97,6 +102,7 @@ FEATURES = NG_FEATURES + EMB_FEATURES + [
     "legal_any_empty", "p_addr_empty", "q_addr_empty", "p_native", "p_dba", "p_is_s3",
     "n_len_q", "n_len_p", "a_len_q", "a_len_p", "n_tok_q", "n_tok_p", "n_idf_cover",
 ]
+FEATURES_EMB = FEATURES + EMB_FEATURES
 
 
 def name_token_idf(pool_path) -> pl.DataFrame:
