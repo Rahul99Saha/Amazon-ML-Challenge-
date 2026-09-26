@@ -22,13 +22,31 @@ log = get("rerank")
 
 
 def build(q_sets: dict[str, pl.Series], block_k: int, ng_k: int, weighting: str,
-          embed: bool = False, embed_model: str = DEFAULT_MODEL, emb_k: int = 50) -> dict[str, pl.DataFrame]:
-    """Features + labels for every query set, fitting one n-gram (+ optional embedding) index per country."""
+          embed: bool = False, embed_model: str = DEFAULT_MODEL, emb_k: int = 50,
+          tag: str = "bm25") -> dict[str, pl.DataFrame]:
+    """Features + labels for every query set, fitting one n-gram (+ optional embedding)
+    index per country.
+
+    Checkpoints per country to work/dev_feats_{tag}_{country}.parquet (atomic tmp+rename).
+    A country whose indices are already fit and features already built (e.g. India,
+    finished overnight) is loaded from its checkpoint instead of redone; only countries
+    without one (e.g. the US pool, picked up the next day) do the expensive work. This is
+    on top of, not instead of, embed.py's own per-field embedding cache: that protects the
+    encode step, this protects the retrieval-and-feature-building step built on top of it.
+    """
     gt = pl.read_parquet(WORK / "train_gt_pairs.parquet").with_columns(label=pl.lit(1, pl.Int8))
     tok_idf = token_idf("train")
     country = pl.read_parquet(WORK / "train_s1.parquet", columns=["idx", "country"])
     parts = {k: [] for k in q_sets}
     for ctry in sorted(country["country"].unique().to_list()):
+        ctry_slug = ctry.replace(" ", "_")
+        ckpt = WORK / f"dev_feats_{tag}_{ctry_slug}.parquet"
+        if ckpt.exists():
+            log.info(f"{ctry}: loading checkpointed features from {ckpt.name}")
+            done = pl.read_parquet(ckpt)
+            for name in q_sets:
+                parts[name].append(done.filter(pl.col("qset") == name).drop("qset"))
+            continue
         in_c = country.filter(pl.col("country") == ctry)["idx"]
         with timed(log, f"{ctry}: fit n-gram index"):
             ng = NgramIndex("train", ctry, weighting=weighting)
@@ -36,6 +54,7 @@ def build(q_sets: dict[str, pl.Series], block_k: int, ng_k: int, weighting: str,
         if embed:
             with timed(log, f"{ctry}: fit embedding index"):
                 emb = EmbeddingIndex("train", ctry, model_name=embed_model)
+        ctry_parts = []
         for name, qs in q_sets.items():
             q = qs.filter(qs.is_in(in_c.implode()))
             if len(q) == 0:
@@ -43,12 +62,16 @@ def build(q_sets: dict[str, pl.Series], block_k: int, ng_k: int, weighting: str,
             log.info(f"{ctry}: {name} set, {len(q):,} queries")
             cand = union_candidates("train", q, ng, block_k, ng_k, emb=emb, emb_k=emb_k)
             for f in featurize("train", cand, ng, tok_idf, emb=emb, label=f"{ctry} {name} features"):
-                parts[name].append(
-                    f.join(gt, on=["q_idx", "p_idx"], how="left").with_columns(pl.col("label").fill_null(0))
-                )
+                labeled = f.join(gt, on=["q_idx", "p_idx"], how="left").with_columns(pl.col("label").fill_null(0))
+                parts[name].append(labeled)
+                ctry_parts.append(labeled.with_columns(qset=pl.lit(name)))
         del ng
         if emb is not None:
             del emb
+        tmp = ckpt.with_name(ckpt.stem + ".tmp.parquet")
+        pl.concat(ctry_parts).write_parquet(tmp)
+        tmp.rename(ckpt)
+        log.info(f"{ctry}: checkpointed {sum(p.height for p in ctry_parts):,} feature rows -> {ckpt.name}")
     return {k: pl.concat(v) for k, v in parts.items()}
 
 
@@ -82,7 +105,7 @@ def main() -> None:
     t = time.time()
     tr_path, ev_path = WORK / f"dev_feats_train_{tag}.parquet", WORK / f"dev_feats_eval_{tag}.parquet"
     if not (tr_path.exists() and ev_path.exists()):
-        sets = build({"train": q_tr, "eval": q_ev}, a.block_k, a.ng_k, a.weighting, a.embed, a.embed_model, a.emb_k)
+        sets = build({"train": q_tr, "eval": q_ev}, a.block_k, a.ng_k, a.weighting, a.embed, a.embed_model, a.emb_k, tag)
         sets["train"].write_parquet(tr_path)
         sets["eval"].write_parquet(ev_path)
     tr, ev = pl.read_parquet(tr_path), pl.read_parquet(ev_path)
