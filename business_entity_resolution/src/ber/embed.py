@@ -122,29 +122,13 @@ class EmbeddingIndex:
         log.info(f"{country}: {pool.height:,} pool records, fields {self.fields}, model {model_name}")
         ctry_slug = country.replace(" ", "_")
 
-        # A .partial.raw/.progress.json pair left by an earlier ABANDONED attempt (a
-        # different country, or a field this instance isn't about to process) is
-        # invisible to _make_room below -- that only knows how to evict *completed*
-        # .npy caches, not in-progress files. Left alone, a stale partial silently
-        # occupies disk quota forever: this is exactly what filled a real run's disk
-        # solid (an old, abandoned name_addr.partial.raw sat there unnoticed while a
-        # fresh attempt at 'name' grew to fill the remaining space). Clean up anything
-        # not one of the fields we're about to process for this country.
         model_slug = _model_slug(model_name)
-        keep = {f"emb_{model_slug}_{split}_{ctry_slug}_{f}" for f in self.fields}
-        for ext in (".partial.raw", ".progress.json"):
-            for stale in WORK.glob(f"emb_{model_slug}_{split}_*{ext}"):
-                if stale.name.removesuffix(ext) in keep:
-                    continue
-                size = stale.stat().st_size
-                stale.unlink()
-                log.info(f"cleaned up stale {stale.name} ({size / 1e9:.2f}GB) left by an earlier abandoned attempt")
         for f in self.fields:
             # The pool encode is the expensive, slow step (minutes to hours per field on a
             # multi-million-record country pool) and everything here otherwise lives only
             # in memory, so a crashed/killed/disconnected session loses all of it. Caching
             # each finished field to disk means a restart resumes instead of re-encoding.
-            cache = WORK / f"emb_{_model_slug(model_name)}_{split}_{ctry_slug}_{f}.npy"
+            cache = WORK / f"emb_{model_slug}_{split}_{ctry_slug}_{f}.npy"
             if cache.exists():
                 log.info(f"{country} '{f}': loading cached embeddings from {cache.name}")
                 vecs = np.load(cache, mmap_mode="r")
@@ -153,7 +137,7 @@ class EmbeddingIndex:
                     "(stale cache from a different data version?)"
                 )
             else:
-                self._make_room(pool.height)
+                self._make_room(pool.height, keep_stem=cache.stem)
                 with timed(log, f"{country}: encode '{f}' ({pool.height:,} records)"):
                     vecs = self._encode_pool(pool[f].to_list(), cache)
             import faiss
@@ -171,31 +155,53 @@ class EmbeddingIndex:
                          else self.model.get_sentence_embedding_dimension)()
         return self._dim
 
-    def _make_room(self, n_rows: int) -> None:
-        """Evicts already-finished caches for this split+model (any country, any earlier
-        EmbeddingIndex instance -- oldest first) if there isn't enough free disk for the
-        next field's full cache.
+    def _make_room(self, n_rows: int, keep_stem: str) -> None:
+        """Evicts already-finished caches AND abandoned in-progress partials for this
+        split+model (any country, any field other than `keep_stem`) if there isn't
+        enough free disk for the field about to be encoded.
 
-        Deliberately not scoped to "this instance's own caches": a completed country's
-        EmbeddingIndex is built once, used for both train/eval query sets, then dropped
-        (see rerank_dev.py/candidates.py) -- nothing ever reads its on-disk cache again
-        once every field in it has been loaded into a FAISS index. So a finished field
-        from *any* country is equally safe to evict, and a fresh country (a new instance,
-        e.g. the run moving from India to the larger US pool) needs to be able to reclaim
-        space from a previous country's leftovers, not just its own.
+        `keep_stem` is that field's own cache stem and is never touched here: if it has
+        a valid partial, _encode_pool resumes it; this function only clears away
+        everything else that could be competing for the same disk quota.
+
+        Two kinds of victim, both safe to evict for the same reason -- once a field is
+        no longer the one being worked on, either it's fully consumed (finished, in a
+        FAISS index already: a completed country's EmbeddingIndex is built once, used
+        for both train/eval query sets, then dropped -- see rerank_dev.py/candidates.py
+        -- so nothing reads its on-disk .npy again) or it's abandoned (an in-progress
+        .partial.raw/.progress.json from an earlier attempt that moved on, restarted, or
+        crashed before reaching that field again). Both cases are indistinguishable from
+        the filesystem alone and both are equally reclaimable:
+          - .npy: a completed field, any country -- e.g. a fresh instance for a larger
+            country (India -> US) reclaiming the previous country's leftovers.
+          - .partial.raw / .progress.json: an in-progress field NOT currently being
+            processed. This is what a real run's disk-quota crash traced back to: a
+            stale name_addr.partial.raw survived, untouched, through an entire later
+            attempt that started 'name' from scratch (its own .npy having already been
+            evicted by an earlier round of this same logic) -- because name_addr was
+            still a legitimate field of that run, just not the one being touched *yet*.
+            The two are only actually distinguishable at all by `keep_stem`: whatever
+            field this specific call is about to encode.
         """
         needed = n_rows * self._get_dim() * 4 + DISK_SAFETY_MARGIN
         free = shutil.disk_usage(WORK).free
         if free >= needed:
             return
-        pattern = f"emb_{_model_slug(self.model_name)}_{self.split}_*.npy"
-        victims = sorted(WORK.glob(pattern), key=lambda p: p.stat().st_mtime)
+        model_slug = _model_slug(self.model_name)
+        victims = []
+        for suffix in (".npy", ".partial.raw", ".progress.json"):
+            for p in WORK.glob(f"emb_{model_slug}_{self.split}_*{suffix}"):
+                if p.name.removesuffix(suffix) != keep_stem:
+                    victims.append(p)
+        victims.sort(key=lambda p: p.stat().st_mtime)
         for victim in victims:
             if free >= needed:
                 break
+            if not victim.exists():  # a .npy and its stray .progress.json can co-list; already gone
+                continue
             size = victim.stat().st_size
             victim.unlink()
-            log.info(f"freed {size / 1e9:.1f}GB by evicting {victim.name} (already consumed) to make room")
+            log.info(f"freed {size / 1e9:.2f}GB by evicting {victim.name} to make room for '{keep_stem}'")
             free = shutil.disk_usage(WORK).free
         if free < needed:
             log.warning(f"only {free / 1e9:.1f}GB free, wanted {needed / 1e9:.1f}GB, and nothing left to evict "
