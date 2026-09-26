@@ -119,7 +119,6 @@ class EmbeddingIndex:
         self.p_ids = pool["idx"].to_numpy()
         self.p_row = pl.DataFrame({"p_idx": pool["idx"], "p_row": np.arange(pool.height, dtype=np.int64)})
         self.index = {}
-        self._own_caches: list[Path] = []  # already loaded into FAISS this run -> evictable if disk is tight
         log.info(f"{country}: {pool.height:,} pool records, fields {self.fields}, model {model_name}")
         ctry_slug = country.replace(" ", "_")
         for f in self.fields:
@@ -146,7 +145,6 @@ class EmbeddingIndex:
             idx.add(vecs)  # FAISS copies vecs into its own storage; we deliberately don't
             self.index[f] = idx  # keep a second copy (see _reconstruct) -- that copy is what OOM'd
             log.info(f"{country} '{f}': {vecs.shape[0]:,} vectors, dim {vecs.shape[1]}")
-            self._own_caches.append(cache)
             del vecs
 
     def _get_dim(self) -> int:
@@ -156,19 +154,30 @@ class EmbeddingIndex:
         return self._dim
 
     def _make_room(self, n_rows: int) -> None:
-        """Evicts already-consumed sibling-field caches (same country, already loaded into
-        FAISS this run -- see __init__) if there isn't enough free disk for the next
-        field's full cache. Only ever touches caches this instance itself wrote/loaded,
-        never another country's or another run's files."""
+        """Evicts already-finished caches for this split+model (any country, any earlier
+        EmbeddingIndex instance -- oldest first) if there isn't enough free disk for the
+        next field's full cache.
+
+        Deliberately not scoped to "this instance's own caches": a completed country's
+        EmbeddingIndex is built once, used for both train/eval query sets, then dropped
+        (see rerank_dev.py/candidates.py) -- nothing ever reads its on-disk cache again
+        once every field in it has been loaded into a FAISS index. So a finished field
+        from *any* country is equally safe to evict, and a fresh country (a new instance,
+        e.g. the run moving from India to the larger US pool) needs to be able to reclaim
+        space from a previous country's leftovers, not just its own.
+        """
         needed = n_rows * self._get_dim() * 4 + DISK_SAFETY_MARGIN
         free = shutil.disk_usage(WORK).free
-        while free < needed and self._own_caches:
-            victim = self._own_caches.pop(0)
-            if not victim.exists():
-                continue
+        if free >= needed:
+            return
+        pattern = f"emb_{_model_slug(self.model_name)}_{self.split}_*.npy"
+        victims = sorted(WORK.glob(pattern), key=lambda p: p.stat().st_mtime)
+        for victim in victims:
+            if free >= needed:
+                break
             size = victim.stat().st_size
             victim.unlink()
-            log.info(f"freed {size / 1e9:.1f}GB by evicting {victim.name} (already in FAISS) to make room")
+            log.info(f"freed {size / 1e9:.1f}GB by evicting {victim.name} (already consumed) to make room")
             free = shutil.disk_usage(WORK).free
         if free < needed:
             log.warning(f"only {free / 1e9:.1f}GB free, wanted {needed / 1e9:.1f}GB, and nothing left to evict "
