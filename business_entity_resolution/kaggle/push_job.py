@@ -53,12 +53,18 @@ for root, _, files in os.walk("/kaggle/input", followlinks=True):
             os.symlink(os.path.join(root, fn), dst); links.append(dst)
 env = dict(os.environ, PYTHONPATH=code, BER_DATA=data, BER_WORK=work,
            BER_OUTPUT="/kaggle/working/output", POLARS_MAX_THREADS="4", PYTHONUNBUFFERED="1")
-print("code", code, "| data", data, "| linked", len(links), "files", flush=True)
+# GPU jobs: steps may use $ACCEL = accelerate launch sized to the visible GPUs.
+ngpu = int(subprocess.run("nvidia-smi -L 2>/dev/null | wc -l", shell=True, capture_output=True, text=True).stdout.strip() or 0)
+env["ACCEL"] = ("accelerate launch --mixed_precision fp16 --num_machines 1 --dynamo_backend no "
+                + (f"--multi_gpu --num_processes {{ngpu}}" if ngpu > 1 else "--num_processes 1") + " -m")
+subprocess.run("nvidia-smi -L 2>/dev/null; nproc; free -g | head -2", shell=True)
+print("code", code, "| data", data, "| linked", len(links), "files | GPUs", ngpu, flush=True)
 ok = True
 for s in STEPS:
     t = time.time()
     print(f"\n===== {{s}}", flush=True)
-    r = subprocess.run(f"{{sys.executable}} -m {{s}}", shell=True, env=env)
+    cmd = s[1:] if s.startswith("!") else f"{{sys.executable}} -m {{s}}"
+    r = subprocess.run(cmd, shell=True, env=env)
     print(f"===== {{s}} -> exit {{r.returncode}} in {{time.time()-t:.0f}}s", flush=True)
     if r.returncode != 0:
         ok = False

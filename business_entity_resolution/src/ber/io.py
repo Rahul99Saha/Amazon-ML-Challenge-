@@ -32,6 +32,23 @@ def is_ce_query(s1_id: pl.Expr, share: float = 0.10) -> pl.Expr:
     return (s1_id.hash(seed=11) % 1000) < int(share * 1000)
 
 
+def in_score_share(s1_id: pl.Expr, share: float) -> pl.Expr:
+    """Fixed hash-based sample of S1 ids that the cross-encoder scores on train."""
+    return (s1_id.hash(seed=5) % 1000) < int(share * 1000)
+
+
+TAG = os.environ.get("BER_TAG", "")
+
+
+def tagged(name: str) -> str:
+    """'train_oof.parquet' -> 'train_oof_v2.parquet' when BER_TAG=v2 (outputs of one version never
+    overwrite another's, which on Kaggle are attached read-only)."""
+    if not TAG:
+        return name
+    stem, dot, ext = name.partition(".")
+    return f"{stem}_{TAG}{dot}{ext}"
+
+
 def load_source(split: str, source: int) -> pl.DataFrame:
     cache = WORK / f"{split}_source{source}.parquet"
     if cache.exists():

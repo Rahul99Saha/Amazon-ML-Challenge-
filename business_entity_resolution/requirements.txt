@@ -1,0 +1,21 @@
+# Python 3.12
+# Core pipeline (CPU): normalisation, blocking, n-gram BM25, features, LightGBM
+polars==1.44.2
+pyarrow==25.0.1
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+rapidfuzz==3.14.6
+anyascii==0.3.3
+lightgbm==4.7.0
+sparse-dot-topn==1.2.0
+
+# Running the pipeline on Kaggle from a local terminal
+kaggle==2.2.4
+gdown
+
+# Optional GPU stage (cross-encoder, microsoft/mdeberta-v3-base, MIT licence);
+# versions pinned once the stage is run on Kaggle
+# torch
+# transformers
+# accelerate

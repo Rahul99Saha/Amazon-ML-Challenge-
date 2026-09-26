@@ -24,10 +24,10 @@ def write(matches: pl.DataFrame, candidates: pl.DataFrame, split: str = "test", 
 
 
 def validate(out: Path = OUTPUT) -> bool:
-    script = DATA.parent / "utils" / "validate_submission.py"
+    script = DATA.resolve().parent / "utils" / "validate_submission.py"
     r = subprocess.run(
         [sys.executable, str(script), "--matching", str(out / "matching_results.tsv"),
-         "--candidate", str(out / "candidate_pairs.tsv"), "--test-dir", str(DATA / "test")],
+         "--candidate", str(out / "candidate_pairs.tsv"), "--test-dir", str(DATA / "test"), "--check-ids"],
         capture_output=True, text=True,
     )
     print(r.stdout[-3000:], r.stderr[-2000:])
