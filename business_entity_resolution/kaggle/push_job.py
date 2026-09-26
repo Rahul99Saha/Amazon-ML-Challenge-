@@ -44,10 +44,10 @@ data = os.path.dirname(find_dir("train_source1.tsv", "train"))
 work = "/kaggle/working/work"
 os.makedirs(work, exist_ok=True)
 links = []
-for root, _, files in os.walk("/kaggle/input", followlinks=True):
+for root, dirs, files in os.walk("/kaggle/input", followlinks=True):
     if os.path.basename(root) != "work":
         continue
-    for fn in files:
+    for fn in files + dirs:  # dirs too, e.g. work/ce_model
         dst = os.path.join(work, fn)
         if not os.path.exists(dst):
             os.symlink(os.path.join(root, fn), dst); links.append(dst)

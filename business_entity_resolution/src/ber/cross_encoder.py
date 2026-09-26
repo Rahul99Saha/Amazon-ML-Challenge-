@@ -140,6 +140,58 @@ def train(keep_k: int, neg_per_q: int, epochs: float, lr: float, bs: int, limit_
 
 
 @torch.no_grad()
+def validate(keep_k: int, bs: int, n_q: int, train_limit_q: int) -> None:
+    """Held-out check on reserved cross-encoder S1 records that were NOT used for training
+    (single GPU): log loss, AUC overall and on the pairs v1 was unsure about, P/R at 0.5."""
+    from sklearn.metrics import log_loss, precision_score, recall_score, roc_auc_score
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    reserved = pair_frame("train", 20, only_ce=True)
+    used = reserved["q_idx"].unique().sort().sample(min(train_limit_q, reserved["q_idx"].n_unique()), seed=1)
+    held = reserved.filter(~pl.col("q_idx").is_in(used.implode()) & (pl.col("rr_rank") <= keep_k))
+    keep = held["q_idx"].unique().sort().sample(min(n_q, held["q_idx"].n_unique()), seed=2)
+    df = held.filter(pl.col("q_idx").is_in(keep.implode()))
+    gt = pl.read_parquet(WORK / "train_gt_pairs.parquet").with_columns(label=pl.lit(1, pl.Int8))
+    df = df.join(gt, on=["q_idx", "p_idx"], how="left").with_columns(pl.col("label").fill_null(0))
+    log.info(f"held-out: {df.height:,} pairs from {df['q_idx'].n_unique():,} reserved S1 never used in training "
+             f"(positives {df['label'].mean():.3f})")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tok = AutoTokenizer.from_pretrained(CE_DIR)
+    model = AutoModelForSequenceClassification.from_pretrained(CE_DIR).to(device).eval().half()
+    df = df.with_columns(L=pl.col("q_text").str.len_chars() + pl.col("p_text").str.len_chars()).sort("L")
+    dl = DataLoader(Pairs(df["q_text"].to_list(), df["p_text"].to_list(), None),
+                    batch_size=bs, shuffle=False, collate_fn=_collate(tok), num_workers=2)
+    out = []
+    for batch in dl:
+        batch.pop("labels")
+        out.append(model(**{k: v.to(device) for k, v in batch.items()}).logits.squeeze(-1).float().cpu().numpy())
+    logit = np.nan_to_num(np.concatenate(out), nan=-20.0, posinf=20.0, neginf=-20.0)
+    p = 1 / (1 + np.exp(-logit))
+    y = df["label"].to_numpy()
+    res = {
+        "pairs": int(len(y)),
+        "log_loss": float(log_loss(y, np.clip(p, 1e-6, 1 - 1e-6))),
+        "auc": float(roc_auc_score(y, p)),
+        "precision@0.5": float(precision_score(y, p >= 0.5)),
+        "recall@0.5": float(recall_score(y, p >= 0.5)),
+    }
+    oof = WORK / "train_oof.parquet"
+    if oof.exists():
+        v1 = df.select("q_idx", "p_idx").with_columns(ce=pl.Series(p), y=pl.Series(y)).join(
+            pl.read_parquet(oof), on=["q_idx", "p_idx"], how="inner")
+        band = v1.filter(pl.col("prob").is_between(0.02, 0.98))
+        if band["y"].n_unique() == 2:
+            res["band_pairs"] = band.height
+            res["band_auc_ce"] = float(roc_auc_score(band["y"], band["ce"]))
+            res["band_auc_v1"] = float(roc_auc_score(band["y"], band["prob"]))
+        res["auc_v1_all"] = float(roc_auc_score(v1["y"], v1["prob"]))
+    for k, v in res.items():
+        log.info(f"VALIDATION {k}: {v:.4f}" if isinstance(v, float) else f"VALIDATION {k}: {v:,}")
+    (WORK / "ce_validation.json").write_text(json.dumps(res, indent=2))
+
+
+@torch.no_grad()
 def score(split: str, keep_k: int, bs: int, share: float, limit_q: int, gate: str, band: tuple[float, float]) -> None:
     from accelerate import Accelerator
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -196,7 +248,7 @@ def score(split: str, keep_k: int, bs: int, share: float, limit_q: int, gate: st
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("step", choices=["train", "score"])
+    ap.add_argument("step", choices=["train", "score", "validate"])
     ap.add_argument("--split", default="train")
     ap.add_argument("--keep-k", type=int, default=20)
     ap.add_argument("--neg-per-q", type=int, default=8)
@@ -208,8 +260,12 @@ if __name__ == "__main__":
     ap.add_argument("--no-freeze-emb", action="store_true", help="also fine-tune the word embeddings")
     ap.add_argument("--gate", default="", help="parquet (q_idx, p_idx, prob) of v1 probabilities in WORK")
     ap.add_argument("--band", nargs=2, type=float, default=[0.02, 0.98], help="score pairs with lo <= prob <= hi")
+    ap.add_argument("--n-val-q", type=int, default=20_000, help="validate: held-out S1 records to check")
+    ap.add_argument("--train-limit-q", type=int, default=150_000, help="validate: --limit-q used in training")
     a = ap.parse_args()
     if a.step == "train":
         train(a.keep_k, a.neg_per_q, a.epochs, a.lr, a.bs, a.limit_q, not a.no_freeze_emb)
+    elif a.step == "validate":
+        validate(a.keep_k, a.bs, a.n_val_q, a.train_limit_q)
     else:
         score(a.split, a.keep_k, a.bs, a.share, a.limit_q, a.gate, tuple(a.band))

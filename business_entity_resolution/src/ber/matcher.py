@@ -21,7 +21,7 @@ import numpy as np
 import polars as pl
 
 from ber import submit
-from ber.context import CONTEXT_FEATURES, add_context, competition
+from ber.context import CONTEXT_FEATURES, add_context, add_twin, competition
 from ber.decide import expected_f05_sets, one_to_one
 from ber.features import FEATURES
 from ber.io import OUTPUT, TAG, WORK, in_score_share, is_ce_query, tagged
@@ -47,7 +47,7 @@ def features(split: str) -> list[str]:
 
 
 def build_ctx(split: str, q_chunk: int = 100_000) -> None:
-    src, dst = WORK / f"{split}_cand.parquet", WORK / f"{split}_ctx.parquet"
+    src, dst = WORK / f"{split}_cand.parquet", WORK / tagged(f"{split}_ctx.parquet")
     slim = pl.read_parquet(src, columns=["q_idx", "p_idx", "rr_prob"])
     qs = slim["q_idx"].unique().sort()
     with timed(log, f"{split}: competition features over {slim.height:,} pairs"):
@@ -59,6 +59,7 @@ def build_ctx(split: str, q_chunk: int = 100_000) -> None:
         ids = qs.slice(s, q_chunk)
         c = pl.scan_parquet(src).filter(pl.col("q_idx").is_in(ids.implode())).collect()
         c = add_context(c, split).join(claims.filter(pl.col("q_idx").is_in(ids.implode())), on=["q_idx", "p_idx"])
+        c = add_twin(c, split)
         part = dst.with_suffix(f".part{i}.parquet")
         c.write_parquet(part)
         parts.append(part)
@@ -69,7 +70,7 @@ def build_ctx(split: str, q_chunk: int = 100_000) -> None:
 
 
 def _rows(split: str, q_ids: pl.Series) -> pl.DataFrame:
-    c = pl.scan_parquet(WORK / f"{split}_ctx.parquet").filter(pl.col("q_idx").is_in(q_ids.implode()))
+    c = pl.scan_parquet(WORK / tagged(f"{split}_ctx.parquet")).filter(pl.col("q_idx").is_in(q_ids.implode()))
     if has_ce(split):
         ce = pl.scan_parquet(WORK / f"{split}_ce.parquet").filter(pl.col("q_idx").is_in(q_ids.implode()))
         # gated scoring: only uncertain pairs have a cross-encoder score; others stay null

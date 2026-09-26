@@ -17,6 +17,14 @@ CONTEXT_FEATURES = [
     "p_n_claims", "p_rank_among_q", "p_best_other", "p_margin_other",
     "cl_name_max", "cl_addr_max", "cl_name_mean", "cl_addr_mean",
 ]
+# "twin" features: separate a true match from a near-identical distractor (same street,
+# house number shifted a little, different legal form, identical name without address)
+TWIN_FEATURES = [
+    "t_name_core_eq", "t_name_compact_eq", "t_legal_conflict", "t_num_mindiff_log",
+    "t_num_min_reldiff", "t_name_eq_addr_empty", "t_num_count_q", "t_num_count_p",
+]
+CONTEXT_FEATURES = CONTEXT_FEATURES + TWIN_FEATURES
+_TWIN_COLS = ["idx", "name_core", "name_compact", "name_legal", "addr_nums", "addr_len"]
 
 
 def _sim(a: list, b: list, scorer) -> np.ndarray:
@@ -46,6 +54,43 @@ def add_context(cand: pl.DataFrame, split: str, anchors: int = 3, strong: float 
     ).with_columns(q_gap_top=pl.col("q_top1") - pl.col("rr_prob"))
 
     return c.with_columns(_cluster(c, split, anchors))
+
+
+def add_twin(c: pl.DataFrame, split: str) -> pl.DataFrame:
+    """Adds TWIN_FEATURES to a candidate frame (q_idx, p_idx, ...)."""
+    q = (pl.scan_parquet(WORK / f"{split}_s1.parquet").select(_TWIN_COLS)
+         .filter(pl.col("idx").is_in(c["q_idx"].unique().implode())).collect())
+    p = (pl.scan_parquet(WORK / f"{split}_pool.parquet").select(_TWIN_COLS)
+         .filter(pl.col("idx").is_in(c["p_idx"].unique().implode())).collect())
+    x = (c.select("q_idx", "p_idx").with_row_index("r")
+         .join(q.rename({k: f"q_{k}" for k in _TWIN_COLS}), left_on="q_idx", right_on="q_idx")
+         .join(p.rename({k: f"p_{k}" for k in _TWIN_COLS}), left_on="p_idx", right_on="p_idx"))
+
+    def nums(col: str) -> pl.Expr:
+        return pl.col(col).list.eval(pl.element().str.slice(0, 9).cast(pl.Int64, strict=False)).list.drop_nulls()
+
+    x = x.with_columns(qn=nums("q_addr_nums"), pn=nums("p_addr_nums"))
+    # closest pair of address numbers (house / plot numbers), absolute and relative
+    d = (x.select("r", "qn", "pn").explode("qn").explode("pn").drop_nulls()
+         .with_columns(ad=(pl.col("qn") - pl.col("pn")).abs())
+         .with_columns(rd=pl.col("ad") / pl.max_horizontal(pl.col("qn").abs(), pl.col("pn").abs(), pl.lit(1)))
+         .group_by("r").agg(mind=pl.col("ad").min(), minrd=pl.col("rd").min()))
+    x = x.join(d, on="r", how="left")
+    legal_q, legal_p = pl.col("q_name_legal").fill_null(""), pl.col("p_name_legal").fill_null("")
+    x = x.select(
+        "r",
+        t_name_core_eq=(pl.col("q_name_core") == pl.col("p_name_core")).cast(pl.Int8),
+        t_name_compact_eq=(pl.col("q_name_compact") == pl.col("p_name_compact")).cast(pl.Int8),
+        t_legal_conflict=((legal_q != "") & (legal_p != "") & (legal_q != legal_p)).cast(pl.Int8),
+        t_num_mindiff_log=(pl.col("mind").cast(pl.Float64) + 1).log().cast(pl.Float32),
+        t_num_min_reldiff=pl.col("minrd").cast(pl.Float32),
+        t_name_eq_addr_empty=((pl.col("q_name_core") == pl.col("p_name_core")) & (pl.col("p_addr_len") == 0)).cast(pl.Int8),
+        t_num_count_q=pl.col("qn").list.len().cast(pl.UInt8),
+        t_num_count_p=pl.col("pn").list.len().cast(pl.UInt8),
+    )
+    out = c.with_row_index("r").join(x, on="r", how="left").drop("r")
+    assert out.height == c.height
+    return out
 
 
 def _cluster(c: pl.DataFrame, split: str, anchors: int) -> list[pl.Series]:
