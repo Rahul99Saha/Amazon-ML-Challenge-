@@ -13,6 +13,7 @@ import numpy as np
 import polars as pl
 
 from ber.candidates import RERANKER, featurize, token_idf, union_candidates
+from ber.embed import DEFAULT_MODEL, EmbeddingIndex
 from ber.features import FEATURES
 from ber.io import WORK
 from ber.log import get, timed
@@ -21,8 +22,9 @@ from ber.ngram import NgramIndex
 log = get("rerank")
 
 
-def build(q_sets: dict[str, pl.Series], block_k: int, ng_k: int, weighting: str) -> dict[str, pl.DataFrame]:
-    """Features + labels for every query set, fitting one n-gram index per country."""
+def build(q_sets: dict[str, pl.Series], block_k: int, ng_k: int, weighting: str,
+          embed: bool = False, embed_model: str = DEFAULT_MODEL, emb_k: int = 50) -> dict[str, pl.DataFrame]:
+    """Features + labels for every query set, fitting one n-gram (+ optional embedding) index per country."""
     gt = pl.read_parquet(WORK / "train_gt_pairs.parquet").with_columns(label=pl.lit(1, pl.Int8))
     tok_idf = token_idf("train")
     country = pl.read_parquet(WORK / "train_s1.parquet", columns=["idx", "country"])
@@ -31,17 +33,23 @@ def build(q_sets: dict[str, pl.Series], block_k: int, ng_k: int, weighting: str)
         in_c = country.filter(pl.col("country") == ctry)["idx"]
         with timed(log, f"{ctry}: fit n-gram index"):
             ng = NgramIndex("train", ctry, weighting=weighting)
+        emb = None
+        if embed:
+            with timed(log, f"{ctry}: fit embedding index"):
+                emb = EmbeddingIndex("train", ctry, model_name=embed_model)
         for name, qs in q_sets.items():
             q = qs.filter(qs.is_in(in_c.implode()))
             if len(q) == 0:
                 continue
             log.info(f"{ctry}: {name} set, {len(q):,} queries")
-            cand = union_candidates("train", q, ng, block_k, ng_k)
-            for f in featurize("train", cand, ng, tok_idf, label=f"{ctry} {name} features"):
+            cand = union_candidates("train", q, ng, block_k, ng_k, emb=emb, emb_k=emb_k)
+            for f in featurize("train", cand, ng, tok_idf, emb=emb, label=f"{ctry} {name} features"):
                 parts[name].append(
                     f.join(gt, on=["q_idx", "p_idx"], how="left").with_columns(pl.col("label").fill_null(0))
                 )
         del ng
+        if emb is not None:
+            del emb
     return {k: pl.concat(v) for k, v in parts.items()}
 
 
@@ -60,7 +68,11 @@ def main() -> None:
     ap.add_argument("--block-k", type=int, default=200)
     ap.add_argument("--ng-k", type=int, default=50)
     ap.add_argument("--weighting", default="bm25", choices=["bm25", "tfidf"])
+    ap.add_argument("--embed", action="store_true", help="add the dense embedding candidate channel (embed.py)")
+    ap.add_argument("--embed-model", default=DEFAULT_MODEL, help="sentence-transformers model name")
+    ap.add_argument("--emb-k", type=int, default=50)
     a = ap.parse_args()
+    tag = a.weighting + ("_emb" if a.embed else "")
 
     all_q = pl.read_parquet(WORK / "train_s1.parquet", columns=["idx"])["idx"].shuffle(seed=42)
     q_tr, q_ev = all_q.slice(0, a.n_train), all_q.slice(a.n_train, a.n_eval)
@@ -68,22 +80,27 @@ def main() -> None:
     gt_ev = gt.filter(pl.col("q_idx").is_in(q_ev.implode()))
 
     t = time.time()
-    tr_path, ev_path = WORK / f"dev_feats_train_{a.weighting}.parquet", WORK / f"dev_feats_eval_{a.weighting}.parquet"
+    tr_path, ev_path = WORK / f"dev_feats_train_{tag}.parquet", WORK / f"dev_feats_eval_{tag}.parquet"
     if not (tr_path.exists() and ev_path.exists()):
-        sets = build({"train": q_tr, "eval": q_ev}, a.block_k, a.ng_k, a.weighting)
+        sets = build({"train": q_tr, "eval": q_ev}, a.block_k, a.ng_k, a.weighting, a.embed, a.embed_model, a.emb_k)
         sets["train"].write_parquet(tr_path)
         sets["eval"].write_parquet(ev_path)
     tr, ev = pl.read_parquet(tr_path), pl.read_parquet(ev_path)
-    print(f"[{a.weighting}] features {time.time() - t:.0f}s  train pairs {tr.height:,}  eval pairs {ev.height:,}  "
+    print(f"[{tag}] features {time.time() - t:.0f}s  train pairs {tr.height:,}  eval pairs {ev.height:,}  "
           f"({ev.height / a.n_eval:.0f}/query)")
 
-    hit = gt_ev.join(ev.select("q_idx", "p_idx", "from_keys", "from_ng"), on=["q_idx", "p_idx"], how="left")
+    chan_cols = ["from_keys", "from_ng"] + (["from_emb"] if a.embed else [])
+    hit = gt_ev.join(ev.select("q_idx", "p_idx", *chan_cols), on=["q_idx", "p_idx"], how="left")
     in_union = hit["from_keys"].is_not_null()
-    print(f"generation recall  keys only {(hit['from_keys'].fill_null(0) == 1).mean():.4f}   "
-          f"n-gram only {(hit['from_ng'].fill_null(0) == 1).mean():.4f}   union {in_union.mean():.4f}")
+    msg = (f"generation recall  keys only {(hit['from_keys'].fill_null(0) == 1).mean():.4f}   "
+           f"n-gram only {(hit['from_ng'].fill_null(0) == 1).mean():.4f}   ")
+    if a.embed:
+        msg += f"embedding only {(hit['from_emb'].fill_null(0) == 1).mean():.4f}   "
+    print(msg + f"union {in_union.mean():.4f}")
     print("blocking score only:")
     recall_at(ev, ev["block_score"].to_numpy(), gt_ev)
-    for f in ("ng_name", "ng_name_addr"):
+    ng_fields = ["ng_name", "ng_name_addr"] + (["emb_name", "emb_name_addr"] if a.embed else [])
+    for f in ng_fields:
         print(f"{f} score only:")
         recall_at(ev, ev[f].to_numpy(), gt_ev)
 
@@ -97,7 +114,7 @@ def main() -> None:
     recall_at(ev, model.predict_proba(ev.select(FEATURES).to_numpy())[:, 1], gt_ev)
     imp = sorted(zip(model.booster_.feature_importance("gain"), FEATURES), reverse=True)[:15]
     print("top features:", [f for _, f in imp])
-    path = RERANKER if a.weighting == "bm25" else Path(str(RERANKER).replace(".txt", f"_{a.weighting}.txt"))
+    path = RERANKER if tag == "bm25" else Path(str(RERANKER).replace(".txt", f"_{tag}.txt"))
     model.booster_.save_model(str(path))
 
 

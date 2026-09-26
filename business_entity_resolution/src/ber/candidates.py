@@ -1,12 +1,16 @@
-"""Candidate generation = union of two channels, then a learned re-ranker.
+"""Candidate generation = union of two or three channels, then a learned re-ranker.
 
   channel 1: rare-key inverted index (blocking.py), top `block_k` by IDF score
   channel 2: character n-gram BM25 (ngram.py), top `ng_k` per field
-  union -> pair features (string sims + n-gram scores for every pair) -> LightGBM
-  re-ranker -> top `keep_k` per S1 kept with all features.
+  channel 3 (optional, --embed): dense multilingual sentence embeddings (embed.py),
+    top `emb_k` per field -- targets train-only-learned channels' blind spot: native
+    scripts and France (see embed.py's docstring)
+  union -> pair features (string sims + n-gram + embedding scores for every pair) ->
+  LightGBM re-ranker -> top `keep_k` per S1 kept with all features.
 
-Processed per country (one n-gram index fit per country) and in super-chunks of
-queries written to disk, so RAM stays bounded and interrupted runs resume.
+Processed per country (one n-gram / embedding index fit per country) and in
+super-chunks of queries written to disk, so RAM stays bounded and interrupted runs
+resume.
 
 Output: work/{split}_cand.parquet  (q_idx, p_idx, FEATURES..., rr_prob, rr_rank)
 """
@@ -17,7 +21,8 @@ import numpy as np
 import polars as pl
 
 from ber.blocking import KINDS, generate_candidates
-from ber.features import FEATURES, REC_COLS, attach_records, name_token_idf, pair_features
+from ber.embed import DEFAULT_MODEL, EmbeddingIndex
+from ber.features import EMB_FIELDS, FEATURES, REC_COLS, attach_records, name_token_idf, pair_features
 from ber.io import WORK
 from ber.log import Progress, get, timed
 from ber.ngram import NgramIndex
@@ -26,24 +31,35 @@ RERANKER = WORK / "reranker.txt"
 log = get("cand")
 
 
-def union_candidates(split: str, q_ids: pl.Series, ng: NgramIndex, block_k: int, ng_k: int) -> pl.DataFrame:
+def union_candidates(split: str, q_ids: pl.Series, ng: NgramIndex, block_k: int, ng_k: int,
+                      emb: EmbeddingIndex | None = None, emb_k: int = 50) -> pl.DataFrame:
     with timed(log, f"key-index candidates for {len(q_ids):,} queries"):
         keys = generate_candidates(split, q_ids, top_k=block_k).with_columns(from_keys=pl.lit(1, pl.Int8))
     with timed(log, f"n-gram top-{ng_k} for {len(q_ids):,} queries"):
         ngc = ng.topk(q_ids, top_k=ng_k).with_columns(from_ng=pl.lit(1, pl.Int8))
     u = keys.join(ngc, on=["q_idx", "p_idx"], how="full", coalesce=True)
+    n_emb = 0
+    if emb is not None:
+        with timed(log, f"embedding top-{emb_k} for {len(q_ids):,} queries"):
+            embc = emb.topk(q_ids, top_k=emb_k).with_columns(from_emb=pl.lit(1, pl.Int8))
+        n_emb = embc.height
+        u = u.join(embc, on=["q_idx", "p_idx"], how="full", coalesce=True)
     log.info(f"union: {u.height:,} pairs ({u.height / max(len(q_ids), 1):.0f}/query; "
-             f"keys {keys.height:,}, n-gram {ngc.height:,})")
-    return u.with_columns(
+             f"keys {keys.height:,}, n-gram {ngc.height:,}" + (f", embedding {n_emb:,}" if emb is not None else "") + ")")
+    fills = [
         pl.col("from_keys", "from_ng").fill_null(0),
         pl.col("block_score").fill_null(0.0),
         pl.col("block_rank").fill_null(65535),
         *[pl.col(f"bk_{k}").fill_null(0) for k in KINDS],
-    )
+    ]
+    if emb is not None:
+        fills.append(pl.col("from_emb").fill_null(0))
+    u = u.with_columns(fills)
+    return u if emb is not None else u.with_columns(from_emb=pl.lit(0, pl.Int8))
 
 
-def featurize(split: str, cand: pl.DataFrame, ng: NgramIndex, tok_idf: pl.DataFrame, chunk: int = 5_000,
-              label: str = "features"):
+def featurize(split: str, cand: pl.DataFrame, ng: NgramIndex, tok_idf: pl.DataFrame,
+              emb: EmbeddingIndex | None = None, chunk: int = 5_000, label: str = "features"):
     """Yields feature frames (q_idx, p_idx, FEATURES) for chunks of queries."""
     q_ids = cand["q_idx"].unique().sort()
     prog = Progress(log, f"{label} (queries)", len(q_ids))
@@ -56,6 +72,13 @@ def featurize(split: str, cand: pl.DataFrame, ng: NgramIndex, tok_idf: pl.DataFr
         c = cand.filter(pl.col("q_idx").is_in(q_ids.slice(s, chunk).implode()))
         n_pairs = c.height
         c = ng.pair_features(c)
+        if emb is not None:
+            c = emb.pair_features(c)
+        else:
+            c = c.with_columns(
+                *[pl.lit(0.0, pl.Float32).alias(f"emb_{f}") for f in EMB_FIELDS],
+                *[pl.lit(65535, pl.UInt16).alias(f"emb_{f}_rank") for f in EMB_FIELDS],
+            )
         yield pair_features(attach_records(c, q, p), tok_idf).select(["q_idx", "p_idx", *FEATURES])
         prog.step(min(chunk, len(q_ids) - s), pairs=f"{n_pairs:,}")
 
@@ -80,9 +103,11 @@ def merge(split: str) -> None:
 
 
 def run(split: str, block_k: int, ng_k: int, keep_k: int, super_chunk: int, weighting: str,
-        countries: list[str] | None, shard: tuple[int, int] = (0, 1)) -> None:
+        countries: list[str] | None, shard: tuple[int, int] = (0, 1),
+        embed: bool = False, embed_model: str = DEFAULT_MODEL, emb_k: int = 50) -> None:
     log.info(f"candidates split={split} countries={countries or 'all'} shard={shard[0]}/{shard[1]} "
-             f"block_k={block_k} ng_k={ng_k} keep_k={keep_k} super_chunk={super_chunk} weighting={weighting}")
+             f"block_k={block_k} ng_k={ng_k} keep_k={keep_k} super_chunk={super_chunk} weighting={weighting} "
+             f"embed={embed}" + (f" embed_model={embed_model} emb_k={emb_k}" if embed else ""))
     with timed(log, "name-token idf"):
         tok_idf = token_idf(split)
     booster = lgb.Booster(model_file=str(RERANKER))
@@ -101,13 +126,17 @@ def run(split: str, block_k: int, ng_k: int, keep_k: int, super_chunk: int, weig
         log.info(f"{ctry}: {len(q_all):,} S1 in country; this job: {len(todo)} super-chunks, {n_todo:,} queries")
         with timed(log, f"{ctry}: fit n-gram index"):
             ng = NgramIndex(split, ctry, weighting=weighting)
+        emb = None
+        if embed:
+            with timed(log, f"{ctry}: fit embedding index"):
+                emb = EmbeddingIndex(split, ctry, model_name=embed_model)
         overall = Progress(log, f"{ctry} OVERALL (queries)", n_todo, every=0)
         for k, (path, s) in enumerate(todo):
             q_ids = q_all.slice(s, super_chunk)
             log.info(f"{ctry}: super-chunk {k + 1}/{len(todo)} ({len(q_ids):,} queries) -> {path.name}")
-            cand = union_candidates(split, q_ids, ng, block_k, ng_k)
+            cand = union_candidates(split, q_ids, ng, block_k, ng_k, emb=emb, emb_k=emb_k)
             kept = []
-            for f in featurize(split, cand, ng, tok_idf, label=f"{ctry} sc{k + 1}/{len(todo)} features"):
+            for f in featurize(split, cand, ng, tok_idf, emb=emb, label=f"{ctry} sc{k + 1}/{len(todo)} features"):
                 f = f.with_columns(rr_prob=pl.Series(booster.predict(f.select(FEATURES).to_numpy()).astype(np.float32)))
                 f = f.with_columns(rr_rank=pl.col("rr_prob").rank("ordinal", descending=True).over("q_idx").cast(pl.UInt16))
                 kept.append(f.filter(pl.col("rr_rank") <= keep_k))
@@ -116,6 +145,8 @@ def run(split: str, block_k: int, ng_k: int, keep_k: int, super_chunk: int, weig
             overall.step(len(q_ids), kept_pairs=f"{out.height:,}")
             del cand, kept, out
         del ng
+        if emb is not None:
+            del emb
 
 
 if __name__ == "__main__":
@@ -129,10 +160,14 @@ if __name__ == "__main__":
     ap.add_argument("--countries", nargs="*", help="only these countries (one Kaggle job each)")
     ap.add_argument("--merge", action="store_true", help="only merge existing parts into {split}_cand.parquet")
     ap.add_argument("--shard", default="0/1", help="i/n: only every n-th super-chunk, starting at i")
+    ap.add_argument("--embed", action="store_true", help="add the dense embedding candidate channel (embed.py)")
+    ap.add_argument("--embed-model", default=DEFAULT_MODEL, help="sentence-transformers model name")
+    ap.add_argument("--emb-k", type=int, default=50)
     a = ap.parse_args()
     shard = tuple(int(x) for x in a.shard.split("/"))
     for sp in a.splits:
         if not a.merge:
-            run(sp, a.block_k, a.ng_k, a.keep_k, a.super_chunk, a.weighting, a.countries, shard)
+            run(sp, a.block_k, a.ng_k, a.keep_k, a.super_chunk, a.weighting, a.countries, shard,
+                a.embed, a.embed_model, a.emb_k)
         if a.merge or not a.countries:
             merge(sp)
