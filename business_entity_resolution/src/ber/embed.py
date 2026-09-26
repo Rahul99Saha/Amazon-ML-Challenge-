@@ -35,12 +35,24 @@ d=384, half the memory) or (b) a FAISS scalar-quantized index (IndexScalarQuanti
 int8) in place of IndexFlatIP -- not implemented here since it needs at-scale testing to
 validate the recall/memory trade-off.
 
+Disk, at full scale. This is the tighter constraint in practice: Kaggle's /kaggle/working
+is capped independently of session RAM (~20GB, seen directly -- a run OOM'd once on RAM,
+then later filled /kaggle/working solid and stopped). Each field's finished cache is the
+same ~15GB per country as above, so two fields for one country can already exceed the
+quota with nothing else on disk. _encode_pool writes its in-progress checkpoint as a
+plain appended-bytes file (not a pre-sized memmap) specifically so a field that's 10%
+done only occupies 10% of its eventual size, not all of it up front; __init__ also
+evicts its own already-consumed sibling caches (already loaded into FAISS this run) if
+free space runs low before starting the next field, trading resumability for the field
+that's already been used for feasibility of the one that hasn't.
+
 Text. Unlike ngram.py's character-3-gram fields, spaces are kept: a transformer tokenises
 into words/subwords, so gluing the name into one token (as the n-gram channel does for
 website-style names) would only hurt it here.
 """
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -89,11 +101,15 @@ def _model_slug(model_name: str) -> str:
     return model_name.replace("/", "__")
 
 
+DISK_SAFETY_MARGIN = 2 * 1024**3  # headroom left for parquet/model/OS after a field's cache
+
+
 class EmbeddingIndex:
     def __init__(self, split: str, country: str, fields=EMB_FIELDS, model_name: str = DEFAULT_MODEL,
                  batch_size: int = 256, device: str | None = None):
         self.split, self.fields, self.model_name, self.batch_size = split, list(fields), model_name, batch_size
         self.model = _get_model(model_name, device)
+        self._dim: int | None = None
         pool = (
             pl.scan_parquet(WORK / f"{split}_pool.parquet")
             .filter(pl.col("country") == country)
@@ -103,6 +119,7 @@ class EmbeddingIndex:
         self.p_ids = pool["idx"].to_numpy()
         self.p_row = pl.DataFrame({"p_idx": pool["idx"], "p_row": np.arange(pool.height, dtype=np.int64)})
         self.index = {}
+        self._own_caches: list[Path] = []  # already loaded into FAISS this run -> evictable if disk is tight
         log.info(f"{country}: {pool.height:,} pool records, fields {self.fields}, model {model_name}")
         ctry_slug = country.replace(" ", "_")
         for f in self.fields:
@@ -119,6 +136,7 @@ class EmbeddingIndex:
                     "(stale cache from a different data version?)"
                 )
             else:
+                self._make_room(pool.height)
                 with timed(log, f"{country}: encode '{f}' ({pool.height:,} records)"):
                     vecs = self._encode_pool(pool[f].to_list(), cache)
             import faiss
@@ -128,7 +146,33 @@ class EmbeddingIndex:
             idx.add(vecs)  # FAISS copies vecs into its own storage; we deliberately don't
             self.index[f] = idx  # keep a second copy (see _reconstruct) -- that copy is what OOM'd
             log.info(f"{country} '{f}': {vecs.shape[0]:,} vectors, dim {vecs.shape[1]}")
+            self._own_caches.append(cache)
             del vecs
+
+    def _get_dim(self) -> int:
+        if self._dim is None:
+            self._dim = (self.model.get_embedding_dimension if hasattr(self.model, "get_embedding_dimension")
+                         else self.model.get_sentence_embedding_dimension)()
+        return self._dim
+
+    def _make_room(self, n_rows: int) -> None:
+        """Evicts already-consumed sibling-field caches (same country, already loaded into
+        FAISS this run -- see __init__) if there isn't enough free disk for the next
+        field's full cache. Only ever touches caches this instance itself wrote/loaded,
+        never another country's or another run's files."""
+        needed = n_rows * self._get_dim() * 4 + DISK_SAFETY_MARGIN
+        free = shutil.disk_usage(WORK).free
+        while free < needed and self._own_caches:
+            victim = self._own_caches.pop(0)
+            if not victim.exists():
+                continue
+            size = victim.stat().st_size
+            victim.unlink()
+            log.info(f"freed {size / 1e9:.1f}GB by evicting {victim.name} (already in FAISS) to make room")
+            free = shutil.disk_usage(WORK).free
+        if free < needed:
+            log.warning(f"only {free / 1e9:.1f}GB free, wanted {needed / 1e9:.1f}GB, and nothing left to evict "
+                        "-- the encode below may still hit the disk quota")
 
     def _encode(self, texts: list[str]) -> np.ndarray:
         return self.model.encode(
@@ -139,48 +183,61 @@ class EmbeddingIndex:
     def _encode_pool(self, texts: list[str], cache: Path, chunk: int = 200_000) -> np.ndarray:
         """Encodes a whole country pool field in resumable chunks, logging every 10%.
 
-        Writes directly into an on-disk memmap (`cache`'s ".partial.npy") and records
-        progress (".progress.json") after every chunk, both via atomic tmp+rename. A
-        crash mid-encode therefore loses at most one chunk (~a minute or two of GPU time
-        at this chunk size), not the whole field: __init__ only ever calls this when the
-        *finished* cache file is missing, and a restart resumes from the last checkpoint
-        rather than row 0.
+        The in-progress file (".partial.raw") is plain appended bytes, not a pre-sized
+        memmap: a field that's 10% done occupies ~10% of its eventual disk footprint, not
+        100% of it from the first write. That matters on Kaggle's ~20GB /kaggle/working
+        quota, where a field newly starting would otherwise instantly claim its full
+        ~15GB before a single record finishes (this is what filled the quota solid on a
+        real run: the just-finished field's cache plus the next field's pre-allocated,
+        still-empty file together exceeded it). Progress (".progress.json") is written
+        after every chunk via atomic tmp+rename, so a crash resumes from the last
+        checkpoint. The finished file becomes a normal .npy via a streamed header+copy
+        that never materialises the whole array to do it.
         """
-        n = len(texts)
-        # renamed get_embedding_dimension in newer sentence-transformers; support both
-        dim = (self.model.get_embedding_dimension if hasattr(self.model, "get_embedding_dimension")
-               else self.model.get_sentence_embedding_dimension)()
+        n, dim = len(texts), self._get_dim()
         progress = cache.with_name(cache.stem + ".progress.json")
-        partial = cache.with_name(cache.stem + ".partial.npy")
+        raw = cache.with_name(cache.stem + ".partial.raw")
 
         done = 0
-        if progress.exists() and partial.exists():
+        if progress.exists() and raw.exists():
             state = json.loads(progress.read_text())
-            if state.get("n") == n and state.get("dim") == dim:
+            if (state.get("n") == n and state.get("dim") == dim
+                    and raw.stat().st_size >= state["done"] * dim * 4):
                 done = state["done"]
                 log.info(f"{cache.stem}: resuming from checkpoint {done:,}/{n:,} ({100 * done / max(n, 1):.0f}%)")
             else:
-                log.info(f"{cache.stem}: stale checkpoint (shape changed) -- restarting from 0")
+                log.info(f"{cache.stem}: stale/short checkpoint -- restarting from 0")
+        if done:
+            with open(raw, "r+b") as f:
+                f.truncate(done * dim * 4)  # drop any partial trailing write from a crash mid-chunk
+        else:
+            raw.unlink(missing_ok=True)
 
-        mm = np.lib.format.open_memmap(partial, mode=("r+" if done else "w+"), dtype=np.float32, shape=(n, dim))
         next_pct = (int(100 * done / max(n, 1)) // 10 + 1) * 10
         t0 = time.time()
-        for s in range(done, n, chunk):
-            e = min(s + chunk, n)
-            mm[s:e] = self._encode(texts[s:e])
-            mm.flush()
-            done = e
-            tmp = progress.with_name(progress.stem + ".tmp" + progress.suffix)
-            tmp.write_text(json.dumps({"n": n, "dim": dim, "done": done}))
-            tmp.rename(progress)
-            pct = 100 * done / max(n, 1)
-            while next_pct <= pct and next_pct <= 100:
-                rate = done / (time.time() - t0) if time.time() > t0 else 0.0
-                eta_min = (n - done) / rate / 60 if rate > 0 else float("nan")
-                log.info(f"{cache.stem}: {next_pct}% ({done:,}/{n:,})  {rate:.0f} rec/s  ETA {eta_min:.0f}m")
-                next_pct += 10
-        del mm
-        partial.rename(cache)
+        with open(raw, "ab" if done else "wb") as f:
+            for s in range(done, n, chunk):
+                e = min(s + chunk, n)
+                f.write(self._encode(texts[s:e]).tobytes())
+                f.flush()
+                os.fsync(f.fileno())
+                done = e
+                tmp = progress.with_name(progress.stem + ".tmp" + progress.suffix)
+                tmp.write_text(json.dumps({"n": n, "dim": dim, "done": done}))
+                tmp.rename(progress)
+                pct = 100 * done / max(n, 1)
+                while next_pct <= pct and next_pct <= 100:
+                    rate = done / (time.time() - t0) if time.time() > t0 else 0.0
+                    eta_min = (n - done) / rate / 60 if rate > 0 else float("nan")
+                    log.info(f"{cache.stem}: {next_pct}% ({done:,}/{n:,})  {rate:.0f} rec/s  ETA {eta_min:.0f}m")
+                    next_pct += 10
+
+        tmp_npy = cache.with_name(cache.stem + ".tmp.npy")
+        with open(tmp_npy, "wb") as out, open(raw, "rb") as inp:
+            np.lib.format.write_array_header_1_0(out, {"descr": "<f4", "fortran_order": False, "shape": (n, dim)})
+            shutil.copyfileobj(inp, out, length=64 * 1024 * 1024)
+        tmp_npy.rename(cache)
+        raw.unlink()
         progress.unlink(missing_ok=True)
         return np.load(cache, mmap_mode="r")
 
