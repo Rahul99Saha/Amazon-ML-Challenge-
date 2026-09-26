@@ -121,6 +121,24 @@ class EmbeddingIndex:
         self.index = {}
         log.info(f"{country}: {pool.height:,} pool records, fields {self.fields}, model {model_name}")
         ctry_slug = country.replace(" ", "_")
+
+        # A .partial.raw/.progress.json pair left by an earlier ABANDONED attempt (a
+        # different country, or a field this instance isn't about to process) is
+        # invisible to _make_room below -- that only knows how to evict *completed*
+        # .npy caches, not in-progress files. Left alone, a stale partial silently
+        # occupies disk quota forever: this is exactly what filled a real run's disk
+        # solid (an old, abandoned name_addr.partial.raw sat there unnoticed while a
+        # fresh attempt at 'name' grew to fill the remaining space). Clean up anything
+        # not one of the fields we're about to process for this country.
+        model_slug = _model_slug(model_name)
+        keep = {f"emb_{model_slug}_{split}_{ctry_slug}_{f}" for f in self.fields}
+        for ext in (".partial.raw", ".progress.json"):
+            for stale in WORK.glob(f"emb_{model_slug}_{split}_*{ext}"):
+                if stale.name.removesuffix(ext) in keep:
+                    continue
+                size = stale.stat().st_size
+                stale.unlink()
+                log.info(f"cleaned up stale {stale.name} ({size / 1e9:.2f}GB) left by an earlier abandoned attempt")
         for f in self.fields:
             # The pool encode is the expensive, slow step (minutes to hours per field on a
             # multi-million-record country pool) and everything here otherwise lives only
