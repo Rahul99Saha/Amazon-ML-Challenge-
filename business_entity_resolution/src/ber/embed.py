@@ -362,7 +362,15 @@ class EmbeddingIndex:
         cols = {}
         for f in self.fields:
             Qv = self._encode(q[f].to_list())
-            cols[f"emb_{f}"] = np.einsum("ij,ij->i", Qv[qi], self._reconstruct(f, pj)).astype(np.float32)
+            mmap = np.memmap(self.cache_paths[f], dtype=STORE_DTYPE, mode="r").reshape(self.pool_height, self._get_dim())
+            scores = np.empty(len(qi), dtype=np.float32)
+            bs = 100_000
+            for start in range(0, len(qi), bs):
+                end = min(start + bs, len(qi))
+                recon = np.ascontiguousarray(mmap[pj[start:end]], dtype=np.float32)
+                scores[start:end] = np.einsum("ij,ij->i", Qv[qi[start:end]], recon)
+                del recon
+            cols[f"emb_{f}"] = scores
         x = x.drop("q_row", "p_row").with_columns([pl.Series(k, v) for k, v in cols.items()])
         return x.with_columns(
             [pl.col(f"emb_{f}").rank("ordinal", descending=True).over("q_idx").cast(pl.UInt16).alias(f"emb_{f}_rank")

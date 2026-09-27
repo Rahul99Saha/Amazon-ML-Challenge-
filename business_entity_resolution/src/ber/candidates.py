@@ -70,10 +70,10 @@ def featurize(split: str, cand: pl.DataFrame, ng: NgramIndex, tok_idf: pl.DataFr
     """Yields feature frames (q_idx, p_idx, FEATURES) for chunks of queries."""
     q_ids = cand["q_idx"].unique().sort()
     prog = Progress(log, f"{label} (queries)", len(q_ids))
-    q = pl.scan_parquet(WORK / f"{split}_s1.parquet").select(REC_COLS).filter(pl.col("idx").is_in(q_ids)).collect()
+    q = pl.scan_parquet(WORK / f"{split}_s1.parquet").select(REC_COLS).filter(pl.col("idx").is_in(q_ids.implode())).collect()
     p = (
         pl.scan_parquet(WORK / f"{split}_pool.parquet").select(REC_COLS)
-        .filter(pl.col("idx").is_in(cand["p_idx"].unique())).collect()
+        .filter(pl.col("idx").is_in(cand["p_idx"].unique().implode())).collect()
     )
     for s in range(0, len(q_ids), chunk):
         c = cand.filter(pl.col("q_idx").is_in(q_ids.slice(s, chunk).implode()))
