@@ -298,20 +298,48 @@ class EmbeddingIndex:
 
     def topk(self, q_ids: pl.Series, top_k: int = 50, min_score: float = 0.5) -> pl.DataFrame:
         """(q_idx, p_idx) for the union over fields of each query's top-k neighbours by cosine sim."""
-        import faiss
         import gc
-        if _IS_MACOS:
-            faiss.omp_set_num_threads(1)
+        import torch
         dim = self._get_dim()
         q = self._queries(q_ids)
         outs = []
+        use_cuda = torch.cuda.is_available()
         for f in self.fields:
             Qv = self._encode(q[f].to_list())
             vecs = np.memmap(self.cache_paths[f], dtype=STORE_DTYPE, mode="r").reshape(self.pool_height, dim)
-            idx = faiss.IndexFlatIP(dim)
-            self._add_in_chunks(idx, vecs)
-            sims, cols = idx.search(Qv, top_k)
-            del idx, vecs
+            if use_cuda:
+                t0 = time.time()
+                # GPU matrix multiplication & topk via PyTorch CUDA Tensor Cores
+                # Stream pool into GPU memory in safe chunks (fits in ~2.6GB for 3.4M records, ~3.8GB for 5M)
+                pool_t = torch.empty((self.pool_height, dim), dtype=torch.float16, device="cuda")
+                chunk_copy = 500_000
+                for s in range(0, self.pool_height, chunk_copy):
+                    e = min(s + chunk_copy, self.pool_height)
+                    pool_t[s:e] = torch.tensor(vecs[s:e], dtype=torch.float16, device="cuda")
+                Q_t = torch.tensor(Qv, dtype=torch.float16, device="cuda")
+                sims_list, cols_list = [], []
+                batch_q = 256
+                for i in range(0, len(q), batch_q):
+                    q_batch = Q_t[i : i + batch_q]
+                    scores = torch.matmul(q_batch, pool_t.T)
+                    s_b, c_b = torch.topk(scores, k=min(top_k, self.pool_height), dim=1, largest=True)
+                    sims_list.append(s_b.to(torch.float32).cpu().numpy())
+                    cols_list.append(c_b.cpu().numpy())
+                    del scores, s_b, c_b
+                sims = np.concatenate(sims_list, axis=0) if sims_list else np.empty((0, top_k), dtype=np.float32)
+                cols = np.concatenate(cols_list, axis=0) if cols_list else np.empty((0, top_k), dtype=np.int64)
+                del pool_t, Q_t
+                torch.cuda.empty_cache()
+                log.info(f"GPU top-{top_k} '{f}': {q.height:,} queries done in {time.time() - t0:.1f}s")
+            else:
+                import faiss
+                if _IS_MACOS:
+                    faiss.omp_set_num_threads(1)
+                idx = faiss.IndexFlatIP(dim)
+                self._add_in_chunks(idx, vecs)
+                sims, cols = idx.search(Qv, top_k)
+                del idx
+            del vecs
             gc.collect()
             rows = np.repeat(np.arange(len(q)), top_k)
             cols, sims = cols.ravel(), sims.ravel()
