@@ -20,41 +20,60 @@ rerank_dev.py --embed with both to compare, the same way ngram.py's BM25-vs-TF-I
 choice was settled.
 
 Retrieval. An EmbeddingIndex is fitted once per (split, country): pool text is encoded
-and L2-normalised, then held in a FAISS IndexScalarQuantizer(QT_fp16) (inner product on
-fp16-quantized vectors == cosine on unit vectors, up to one rounding step) -- FAISS plays
-the same role here that sparse_dot_topn plays for the BM25 channel: an optimised library
-doing top-k, not a hand-rolled loop. Encoding happens per-country and per-field, one field
-at a time, but the FAISS index for *every* field is kept resident for the object's whole
-lifetime (topk/pair_features need all fields available together), which is the actual
-memory constraint below, separate from the encode step's own field-at-a-time disk usage.
+and L2-normalised, then searched via FAISS IndexFlatIP (exact inner product == cosine on
+unit vectors) -- FAISS plays the same role here that sparse_dot_topn plays for the BM25
+channel: an optimised library doing exact top-k, not a hand-rolled loop and not an
+approximate index (see the RAM/speed history below for why "approximate" was tried and
+rejected). Encoding happens per-country and per-field, written to disk once each; the
+FAISS index itself is built lazily and only one field's is ever resident in RAM at a
+time (_get_index), rebuilt from the on-disk cache whenever a caller switches fields.
 
-Memory/disk, at full scale. A pool of P records at dimension d costs 4*P*d bytes per
-field in float32. LaBSE is d=768: for the larger train pools (~6.2M US records) that's
-~17.7GB for a *single* field -- already close to or over Kaggle's /kaggle/working quota
-(~20GB, confirmed directly: one run OOM'd on RAM, another separately filled
-/kaggle/working solid and stopped) even before accounting for anything else that has to
-coexist with it (prepared parquet, blocking.py's pool-wide key index).
+Memory/disk, at full scale, and the two dead ends that got here. A pool of P records at
+dimension d costs 4*P*d bytes per field in float32. LaBSE is d=768: for the larger train
+pools (~6.2M US records) that's ~17.7GB for a *single* field -- already close to or over
+Kaggle's /kaggle/working quota (~20GB) even before anything else that has to coexist with
+it (prepared parquet, blocking.py's pool-wide key index). Disk fix: everything persisted
+here -- the in-progress ".partial.raw" and the finished cache -- is stored at STORE_DTYPE
+(float16, 2 bytes/dim), halving that to ~8.85GB.
 
-Everything this module persists to disk -- the in-progress ".partial.raw" and the
-finished cache -- is therefore stored at STORE_DTYPE (float16, 2 bytes/dim) rather than
-float32, halving that to ~8.85GB. This is disk-only and does not by itself help RAM: a
-plain IndexFlatIP always stores vectors at float32 internally regardless of on-disk
-dtype, and with two fields' indexes both resident at once that's ~25.4GB for India's
-4.1M-record pool alone -- confirmed to actually OOM-kill a real run (no traceback, just
-silence right after "fit embedding index done") on a ~29GB Kaggle session, once the model
-weights and blocking.py's own pool-wide key-building got their turn on top of it. Using
-IndexScalarQuantizer(QT_fp16) instead halves FAISS's own RAM the same way STORE_DTYPE
-halves disk: ~12.7GB for India's two fields combined, ~19GB for US's -- the same single
-fp32->fp16->fp32 rounding the disk cache already tolerates, not the coarser QT_8bit
-quantization that would be the next lever if this margin still isn't enough. _train_index
-calibrates the quantizer on a small random sample rather than the full cache, since
-QT_fp16 has no real per-dimension statistics to learn from a larger one anyway.
+That fixed disk but not RAM: the *first* version kept a full FAISS IndexFlatIP for every
+field resident for the object's whole lifetime (topk/pair_features loop over all fields).
+A flat index always stores vectors at float32 internally regardless of on-disk dtype, so
+two fields' indexes at once cost ~25.4GB for India's 4.1M-record pool alone -- confirmed
+to actually OOM-kill a real run (no traceback, just silence right after "fit embedding
+index done") on a ~29GB Kaggle session, once model weights and blocking.py's own
+pool-wide key-building got a turn on top of it.
 
-Half-precision keeps ~3-4 significant decimal digits, which cosine similarity over 768
-summed dimensions tolerates well (the individual roundings mostly cancel rather than
-compound) -- unlike substituting a smaller/weaker-coverage model, which would be a real
-quality trade-off on the exact native-script cases this channel exists for, precision
-(disk or FAISS) is not.
+The *second* version fixed the RAM by switching to IndexScalarQuantizer(QT_fp16), which
+does halve FAISS's own resident size -- but search on a quantized index has to decode
+each stored vector back out per comparison instead of one dense BLAS matmul over raw
+floats, and that turned out to cost far more than the RAM it saved: measured directly,
+~12-15x slower per query-pool-vector pair than a plain flat index. At India's real
+scale that meant an 89-minute wall-clock search for one field's dev-sample queries alone,
+which would have pushed a full run (both countries, both query sets) well past Kaggle's
+12h session cap. An IVF (clustered, search-a-subset) index would fix the speed without
+giving RAM back, but was rejected too: tested on synthetic data it recovered only
+10-32% of exact top-50 results depending on nprobe, and there was no quick way to
+validate that a real recall on LaBSE's actual embedding space would look any better --
+not a trade worth taking sight-unseen for a channel whose whole point is recall.
+
+The actual fix: keep the fast, exact IndexFlatIP, but never hold more than one field's
+index in RAM at once. `_get_index(f)` builds a field's index from its on-disk fp16 cache
+on first use and keeps it until a caller asks for a *different* field, at which point the
+previous one is dropped and the new one built. Peak RAM is now one field's flat index
+(~12.7GB India, ~19.2GB US) -- the same ceiling the quantized version gave for *both*
+fields combined -- with full exact search speed restored. The cost is a rebuild (read
+the fp16 cache back off disk, populate FAISS) each time a caller alternates fields across
+separate topk()/pair_features() calls -- observed to cost low single-digit minutes per
+rebuild, i.e. a handful of extra minutes per country total, utterly negligible next to
+the multi-hour difference in search cost it replaces.
+
+Half-precision (the disk cache, and the one fp16->fp32 upcast on every rebuild) keeps
+~3-4 significant decimal digits, which cosine similarity over 768 summed dimensions
+tolerates well (the individual roundings mostly cancel rather than compound) -- unlike
+substituting a smaller/weaker-coverage model or an approximate index, both real quality
+trade-offs on the exact native-script cases this channel exists for; storage precision
+is not.
 
 _add_in_chunks upcasts fp16 -> fp32 in bounded batches rather than all at once: a single
 `vecs.astype(np.float32)` on the whole cache would eagerly materialise the full field in
@@ -140,7 +159,10 @@ class EmbeddingIndex:
         )
         self.p_ids = pool["idx"].to_numpy()
         self.p_row = pl.DataFrame({"p_idx": pool["idx"], "p_row": np.arange(pool.height, dtype=np.int64)})
-        self.index = {}
+        self.n_pool = pool.height
+        self._cache_path: dict[str, Path] = {}
+        self._active_field: str | None = None
+        self._active_index = None  # only one field's FAISS index resident at a time; see _get_index
         log.info(f"{country}: {pool.height:,} pool records, fields {self.fields}, model {model_name}")
         ctry_slug = country.replace(" ", "_")
 
@@ -150,9 +172,11 @@ class EmbeddingIndex:
             # multi-million-record country pool) and everything here otherwise lives only
             # in memory, so a crashed/killed/disconnected session loses all of it. Caching
             # each finished field to disk means a restart resumes instead of re-encoding.
+            # Building the FAISS index itself is deferred to _get_index -- only the on-disk
+            # cache needs to exist here.
             cache = WORK / f"emb_{model_slug}_{split}_{ctry_slug}_{f}.npy"
+            self._cache_path[f] = cache
             if cache.exists():
-                log.info(f"{country} '{f}': loading cached embeddings from {cache.name}")
                 # Not a real .npy (no header) -- see _encode_pool's finalize step for why.
                 dim = self._get_dim()
                 expected = pool.height * dim * BYTES_PER_DIM
@@ -161,51 +185,35 @@ class EmbeddingIndex:
                     f"{cache}: {actual} bytes on disk, expected {expected} for {pool.height:,} x {dim} "
                     f"{STORE_DTYPE.__name__} (stale cache from a different data version?)"
                 )
-                vecs = np.memmap(cache, dtype=STORE_DTYPE, mode="r").reshape(pool.height, dim)
+                log.info(f"{country} '{f}': cache already present ({cache.name})")
             else:
                 self._make_room(pool.height, keep_stem=cache.stem)
                 with timed(log, f"{country}: encode '{f}' ({pool.height:,} records)"):
-                    vecs = self._encode_pool(pool[f].to_list(), cache)
-            import faiss
-            if _IS_MACOS:
-                faiss.omp_set_num_threads(1)  # env var alone isn't always honoured; see note above
-            # IndexScalarQuantizer(QT_fp16), not IndexFlatIP: a flat index always stores
-            # vectors at float32 internally regardless of on-disk dtype, and holding one
-            # per field for the whole object's lifetime is the real RAM cost -- for India's
-            # 4.1M-record pool that's ~12.7GB per field, ~25.4GB for both fields at once,
-            # which is most of a Kaggle session's ~29GB RAM before the model, pool metadata
-            # or blocking.py's own key-building even get a turn (this is what silently
-            # OOM-killed a real run right after embeddings finished, with no traceback).
-            # QT_fp16 halves that to ~6.35GB/field with only the same fp32->fp16->fp32
-            # rounding the disk cache already tolerates -- not the coarser, lossier int8
-            # scalar quantization (QT_8bit) that would be the next lever if this isn't
-            # enough headroom.
-            idx = faiss.IndexScalarQuantizer(vecs.shape[1], faiss.ScalarQuantizer.QT_fp16, faiss.METRIC_INNER_PRODUCT)
-            self._train_index(idx, vecs)
-            self._add_in_chunks(idx, vecs)  # FAISS always gets float32; vecs may be fp16 on disk
-            self.index[f] = idx
-            log.info(f"{country} '{f}': {vecs.shape[0]:,} vectors, dim {vecs.shape[1]}")
-            del vecs
+                    self._encode_pool(pool[f].to_list(), cache)
+
+    def _get_index(self, f: str):
+        """Lazily (re)builds field f's FAISS IndexFlatIP from its on-disk cache, evicting
+        whichever field was previously active. Only one field's index is ever resident in
+        RAM at once (see module docstring for why: this replaced a quantized index that
+        saved the same RAM but made search 12-15x slower)."""
+        if self._active_field == f:
+            return self._active_index
+        self._active_index = None  # drop the reference so it can be freed before building the next
+        vecs = np.memmap(self._cache_path[f], dtype=STORE_DTYPE, mode="r").reshape(self.n_pool, self._get_dim())
+        import faiss
+        if _IS_MACOS:
+            faiss.omp_set_num_threads(1)  # env var alone isn't always honoured; see note above
+        idx = faiss.IndexFlatIP(vecs.shape[1])
+        self._add_in_chunks(idx, vecs)  # FAISS always gets float32; vecs may be fp16 on disk
+        self._active_field, self._active_index = f, idx
+        log.info(f"'{f}': {vecs.shape[0]:,} vectors loaded into FAISS, dim {vecs.shape[1]}")
+        return idx
 
     def _get_dim(self) -> int:
         if self._dim is None:
             self._dim = (self.model.get_embedding_dimension if hasattr(self.model, "get_embedding_dimension")
                          else self.model.get_sentence_embedding_dimension)()
         return self._dim
-
-    @staticmethod
-    def _train_index(idx, vecs: np.ndarray, sample: int = 200_000) -> None:
-        """IndexScalarQuantizer must be trained (is_trained flips True) before add(), even
-        for QT_fp16 where the "training" has no real per-dimension stats to learn -- a
-        small random sample is enough and avoids materialising the whole (possibly
-        multi-GB) fp16 cache in RAM just to satisfy the API."""
-        n = vecs.shape[0]
-        if n <= sample:
-            train_vecs = np.ascontiguousarray(vecs, dtype=np.float32)
-        else:
-            rows = np.sort(np.random.default_rng(0).choice(n, size=sample, replace=False))
-            train_vecs = np.ascontiguousarray(vecs[rows], dtype=np.float32)
-        idx.train(train_vecs)
 
     @staticmethod
     def _add_in_chunks(idx, vecs: np.ndarray, chunk: int = 500_000) -> None:
@@ -215,10 +223,8 @@ class EmbeddingIndex:
         `vecs.astype(np.float32)` call over the whole thing would eagerly materialise the
         entire field in RAM (a memmap lets the OS page it in incrementally as FAISS's own
         `add()` reads through it; `.astype()` does not), reintroducing the kind of RAM
-        spike the fp16 disk format was chosen partly to avoid. `add()`'s input must be
-        float32 regardless of index type; the IndexScalarQuantizer(QT_fp16) index this
-        feeds re-quantizes it straight back down to fp16 for its own internal storage --
-        this only bounds the *conversion* batch size, not the index's resident size.
+        spike the fp16 disk format was chosen partly to avoid. FAISS's own internal
+        storage ends up plain float32 either way -- this only bounds the *conversion*.
         """
         for s in range(0, vecs.shape[0], chunk):
             e = min(s + chunk, vecs.shape[0])
@@ -371,7 +377,7 @@ class EmbeddingIndex:
         outs = []
         for f in self.fields:
             Qv = self._encode(q[f].to_list())
-            sims, cols = self.index[f].search(Qv, top_k)
+            sims, cols = self._get_index(f).search(Qv, top_k)
             rows = np.repeat(np.arange(len(q)), top_k)
             cols, sims = cols.ravel(), sims.ravel()
             keep = (cols >= 0) & (sims >= min_score)
@@ -382,7 +388,7 @@ class EmbeddingIndex:
     def _reconstruct(self, f: str, rows: np.ndarray) -> np.ndarray:
         """Pulls specific pool vectors back out of the FAISS index (see __init__: we don't
         keep a second copy of the full pool matrix around just for this)."""
-        idx = self.index[f]
+        idx = self._get_index(f)
         if hasattr(idx, "reconstruct_batch"):
             return idx.reconstruct_batch(rows.astype(np.int64))
         return np.stack([idx.reconstruct(int(i)) for i in rows])
