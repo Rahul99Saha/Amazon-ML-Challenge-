@@ -21,8 +21,8 @@ gdown
 # accelerate
 
 # Optional: dense embedding candidate channel (embed.py, --embed flag).
-# Default model sentence-transformers/LaBSE (Apache-2.0, ~471M params). CPU works for
-# rerank_dev.py-scale dev samples; GPU recommended for full-scale candidates.py runs.
+# Default model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 (Apache-2.0, ~117M params, 384-dim).
+# CPU works for rerank_dev.py-scale dev samples; GPU recommended for full-scale candidates.py runs.
 # torch
 # sentence-transformers
 # faiss-cpu

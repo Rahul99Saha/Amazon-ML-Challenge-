@@ -10,14 +10,13 @@ multilingual sentence embedding model brings that generalisation from its own
 pretraining instead of from our training pairs, so it is expected to help most on
 exactly those residual misses.
 
-Model. Default is sentence-transformers/LaBSE (Apache-2.0, ~471M params, well under the
-8B/permissive-license constraint): trained for cross-lingual sentence-level semantic
-similarity across 100+ languages, which is the right objective for matching a Devanagari
-/ Tamil / Kannada / Gujarati / Odia name against its Latin-script counterpart. Any other
-sentence-transformers model can be swapped in via `model_name` (e.g. the smaller, MIT
-licensed intfloat/multilingual-e5-base) to trade recall for memory/speed -- run
-rerank_dev.py --embed with both to compare, the same way ngram.py's BM25-vs-TF-IDF
-choice was settled.
+Model. Default is sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 (Apache-2.0,
+~117M params, 384-dim, well under the 8B/permissive-license constraint): trained for cross-lingual
+sentence-level semantic similarity across 50+ languages, which is the right objective for
+matching a Devanagari / Tamil / Kannada / Gujarati / Odia name against its Latin-script counterpart.
+Any other sentence-transformers model can be swapped in via `model_name` to trade recall for
+memory/speed -- run rerank_dev.py --embed with both to compare, the same way ngram.py's
+BM25-vs-TF-IDF choice was settled.
 
 Retrieval. An EmbeddingIndex is fitted once per (split, country): pool text is encoded
 and L2-normalised, then held in a FAISS IndexFlatIP (exact inner product == cosine on
@@ -27,21 +26,17 @@ approximate index. Encoding happens per-country and per-field, one field at a ti
 only one field's vectors are resident at once.
 
 Memory/disk, at full scale. A pool of P records at dimension d costs 4*P*d bytes per
-field in float32. LaBSE is d=768: for the larger train pools (~6.2M US records) that's
-~17.7GB for a *single* field -- already close to or over Kaggle's /kaggle/working quota
-(~20GB, confirmed directly: one run OOM'd on RAM, another separately filled
-/kaggle/working solid and stopped) even before accounting for anything else that has to
-coexist with it (prepared parquet, blocking.py's pool-wide key index).
+field in float32. paraphrase-multilingual-MiniLM-L12-v2 is d=384: for the larger train pools
+(~6.2M US records) that's ~4.76GB for a single field in float16 (halving LaBSE's 768-dim footprint
+of ~9.5GB), comfortably within Kaggle's /kaggle/working quota (~20GB) while coexisting with
+prepared parquet and blocking keys.
 
 Everything this module persists to disk -- the in-progress ".partial.raw" and the
 finished cache -- is therefore stored at STORE_DTYPE (float16, 2 bytes/dim) rather than
-float32, halving that to ~8.85GB. This is a storage-only choice: FAISS's index is always
-populated at full float32 (see _add_in_chunks), so search/reconstruction precision is
-unaffected beyond the single fp32->fp16->fp32 round-trip: half-precision keeps ~3-4
-significant decimal digits, which cosine similarity over 768 summed dimensions tolerates
-well (the individual roundings mostly cancel rather than compound) -- unlike substituting
-a smaller/weaker-coverage model, which would be a real quality trade-off on the exact
-native-script cases this channel exists for, storage precision is not.
+float32. This is a storage-only choice: FAISS's index is always populated at full float32
+(see _add_in_chunks), so search/reconstruction precision is unaffected beyond the single
+fp32->fp16->fp32 round-trip: half-precision keeps ~3-4 significant decimal digits, which
+cosine similarity over 384 summed dimensions tolerates well.
 
 _add_in_chunks upcasts fp16 -> fp32 in bounded batches rather than all at once: a single
 `vecs.astype(np.float32)` on the whole cache would eagerly materialise the full field in
@@ -85,7 +80,7 @@ from ber.log import get, timed
 
 log = get("embed")
 
-DEFAULT_MODEL = "sentence-transformers/LaBSE"
+DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 FIELDS = {
     "name": pl.col("name_core"),
@@ -185,31 +180,15 @@ class EmbeddingIndex:
 
     def _make_room(self, n_rows: int, keep_stem: str) -> None:
         """Evicts already-finished caches AND abandoned in-progress partials for this
-        split+model (any country, any field other than `keep_stem`) if there isn't
+        split (any country, any field other than `keep_stem`) if there isn't
         enough free disk for the field about to be encoded.
 
         `keep_stem` is that field's own cache stem and is never touched here: if it has
         a valid partial, _encode_pool resumes it; this function only clears away
         everything else that could be competing for the same disk quota.
 
-        Two kinds of victim, both safe to evict for the same reason -- once a field is
-        no longer the one being worked on, either it's fully consumed (finished, in a
-        FAISS index already: a completed country's EmbeddingIndex is built once, used
-        for both train/eval query sets, then dropped -- see rerank_dev.py/candidates.py
-        -- so nothing reads its on-disk .npy again) or it's abandoned (an in-progress
-        .partial.raw/.progress.json from an earlier attempt that moved on, restarted, or
-        crashed before reaching that field again). Both cases are indistinguishable from
-        the filesystem alone and both are equally reclaimable:
-          - .npy: a completed field, any country -- e.g. a fresh instance for a larger
-            country (India -> US) reclaiming the previous country's leftovers.
-          - .partial.raw / .progress.json: an in-progress field NOT currently being
-            processed. This is what a real run's disk-quota crash traced back to: a
-            stale name_addr.partial.raw survived, untouched, through an entire later
-            attempt that started 'name' from scratch (its own .npy having already been
-            evicted by an earlier round of this same logic) -- because name_addr was
-            still a legitimate field of that run, just not the one being touched *yet*.
-            The two are only actually distinguishable at all by `keep_stem`: whatever
-            field this specific call is about to encode.
+        Victims from other models (e.g. leftover runs from larger models) are prioritized
+        for eviction first.
         """
         needed = n_rows * self._get_dim() * BYTES_PER_DIM + DISK_SAFETY_MARGIN
         free = shutil.disk_usage(WORK).free
@@ -218,10 +197,10 @@ class EmbeddingIndex:
         model_slug = _model_slug(self.model_name)
         victims = []
         for suffix in (".npy", ".partial.raw", ".progress.json"):
-            for p in WORK.glob(f"emb_{model_slug}_{self.split}_*{suffix}"):
+            for p in WORK.glob(f"emb_*_{self.split}_*{suffix}"):
                 if p.name.removesuffix(suffix) != keep_stem:
                     victims.append(p)
-        victims.sort(key=lambda p: p.stat().st_mtime)
+        victims.sort(key=lambda p: (0 if model_slug not in p.name else 1, p.stat().st_mtime))
         for victim in victims:
             if free >= needed:
                 break
