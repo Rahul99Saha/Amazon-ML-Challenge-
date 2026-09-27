@@ -130,20 +130,35 @@ def _pairs(left: pl.DataFrame, right: pl.DataFrame, same: bool) -> pl.DataFrame:
     return a.join(b, on="idx").filter(pl.col("a") < pl.col("b"))
 
 
-def build_keys(src: Path, dst: Path, wdf: pl.DataFrame, rows: int = 1_000_000) -> Path:
+def build_keys(src: Path, dst: Path, wdf: pl.DataFrame, rows: int = 1_000_000) -> str:
+    """Returns a path pl.scan_parquet can read for the keys table: either `dst` itself
+    (a legacy, already-merged file from before this function stopped merging) or a glob
+    over the per-slice parts.
+
+    The parts are deliberately never concatenated into `dst`. Merging would need the
+    parts (~2-3GB for the full train pool) AND the growing merged file to coexist on
+    disk simultaneously until the merge finishes -- up to 2x the size, for no benefit:
+    pl.scan_parquet reads a glob of files exactly like one file. This is what silently
+    killed a real run immediately after it had *just* barely fit India's embeddings:
+    generate_candidates' first call builds keys for the *entire* pool (both countries,
+    ~10.3M records for train), not just the queries' own country, so this cost lands
+    regardless of which country's candidates are being generated. Building part-by-part
+    also means a restart only redoes whichever parts are missing, not everything.
+    """
     if dst.exists():
-        return dst
+        return str(dst)
+    glob = str(dst.parent / f"{dst.stem}.part*.parquet")
     n = pl.scan_parquet(src).select(pl.len()).collect().item()
-    parts = []
-    for i, off in enumerate(range(0, n, rows)):
+    offsets = list(range(0, n, rows))
+    parts = [dst.with_suffix(f".part{i}.parquet") for i in range(len(offsets))]
+    if parts and all(p.exists() for p in parts):
+        return glob
+    for i, off in enumerate(offsets):
+        if parts[i].exists():
+            continue
         df = pl.scan_parquet(src).select(KEY_COLS).slice(off, rows).collect()
-        part = dst.with_suffix(f".part{i}.parquet")
-        record_keys(df, wdf).write_parquet(part)
-        parts.append(part)
-    pl.concat([pl.scan_parquet(p) for p in parts]).sink_parquet(dst)
-    for p in parts:
-        p.unlink()
-    return dst
+        record_keys(df, wdf).write_parquet(parts[i])
+    return glob
 
 
 def generate_candidates(
