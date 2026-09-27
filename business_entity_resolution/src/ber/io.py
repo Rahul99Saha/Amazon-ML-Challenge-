@@ -52,10 +52,15 @@ def tagged(name: str) -> str:
 def load_source(split: str, source: int) -> pl.DataFrame:
     cache = WORK / f"{split}_source{source}.parquet"
     if cache.exists():
-        return pl.read_parquet(cache)
+        try:
+            return pl.read_parquet(cache)
+        except Exception:
+            cache.unlink(missing_ok=True)
     df = _read_tsv(DATA / split / f"{split}_source{source}.tsv", SOURCE_SCHEMA)
     WORK.mkdir(exist_ok=True)
-    df.write_parquet(cache)
+    tmp = cache.with_name(cache.stem + ".tmp.parquet")
+    df.write_parquet(tmp)
+    tmp.rename(cache)
     return df
 
 
