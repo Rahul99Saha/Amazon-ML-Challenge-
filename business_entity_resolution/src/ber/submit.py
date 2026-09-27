@@ -32,3 +32,28 @@ def validate(out: Path = OUTPUT) -> bool:
     )
     print(r.stdout[-3000:], r.stderr[-2000:])
     return r.returncode == 0
+
+
+def from_candidates(split: str = "test", out: Path = OUTPUT) -> None:
+    """Produces matching_results.tsv and candidate_pairs.tsv directly from {split}_cand.parquet."""
+    from ber.decide import expected_f05_sets, one_to_one
+    cand_path = WORK / f"{split}_cand.parquet"
+    assert cand_path.exists(), f"{cand_path} does not exist. Run candidates.py --splits {split} first."
+    cand = pl.read_parquet(cand_path)
+    cands_df = cand.select("q_idx", "p_idx")
+    scores = cand.rename({"rr_prob": "prob"}).select("q_idx", "p_idx", "prob")
+    matches = expected_f05_sets(one_to_one(scores))
+    print(f"Produced {matches.height:,} final matches from {cands_df.height:,} candidates")
+    write(matches.select("q_idx", "p_idx"), cands_df, split=split, out=out)
+    if validate(out):
+        print("VALIDATION PASSED: Files are ready to submit!")
+    else:
+        print("Validation check finished.")
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--split", default="test")
+    args = ap.parse_args()
+    from_candidates(args.split)
