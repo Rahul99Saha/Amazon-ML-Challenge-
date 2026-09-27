@@ -26,25 +26,32 @@ channel: an optimised library doing exact top-k, not a hand-rolled loop and not 
 approximate index. Encoding happens per-country and per-field, one field at a time, so
 only one field's vectors are resident at once.
 
-Memory, at full scale. A pool of P records encoded at dimension d in float32 costs
-4*P*d bytes per field. LaBSE is d=768: sharded per country (~5M records for the larger
-train pools), that is ~15GB for one field -- fits Kaggle's ~30GB CPU RAM one field at a
-time (as done here) but leaves little headroom. If that is a problem in practice, the
-two levers are (a) a smaller-dimension model (e.g. paraphrase-multilingual-MiniLM-L12-v2,
-d=384, half the memory) or (b) a FAISS scalar-quantized index (IndexScalarQuantizer,
-int8) in place of IndexFlatIP -- not implemented here since it needs at-scale testing to
-validate the recall/memory trade-off.
+Memory/disk, at full scale. A pool of P records at dimension d costs 4*P*d bytes per
+field in float32. LaBSE is d=768: for the larger train pools (~6.2M US records) that's
+~17.7GB for a *single* field -- already close to or over Kaggle's /kaggle/working quota
+(~20GB, confirmed directly: one run OOM'd on RAM, another separately filled
+/kaggle/working solid and stopped) even before accounting for anything else that has to
+coexist with it (prepared parquet, blocking.py's pool-wide key index).
 
-Disk, at full scale. This is the tighter constraint in practice: Kaggle's /kaggle/working
-is capped independently of session RAM (~20GB, seen directly -- a run OOM'd once on RAM,
-then later filled /kaggle/working solid and stopped). Each field's finished cache is the
-same ~15GB per country as above, so two fields for one country can already exceed the
-quota with nothing else on disk. _encode_pool writes its in-progress checkpoint as a
-plain appended-bytes file (not a pre-sized memmap) specifically so a field that's 10%
-done only occupies 10% of its eventual size, not all of it up front; __init__ also
-evicts its own already-consumed sibling caches (already loaded into FAISS this run) if
-free space runs low before starting the next field, trading resumability for the field
-that's already been used for feasibility of the one that hasn't.
+Everything this module persists to disk -- the in-progress ".partial.raw" and the
+finished cache -- is therefore stored at STORE_DTYPE (float16, 2 bytes/dim) rather than
+float32, halving that to ~8.85GB. This is a storage-only choice: FAISS's index is always
+populated at full float32 (see _add_in_chunks), so search/reconstruction precision is
+unaffected beyond the single fp32->fp16->fp32 round-trip: half-precision keeps ~3-4
+significant decimal digits, which cosine similarity over 768 summed dimensions tolerates
+well (the individual roundings mostly cancel rather than compound) -- unlike substituting
+a smaller/weaker-coverage model, which would be a real quality trade-off on the exact
+native-script cases this channel exists for, storage precision is not.
+
+_add_in_chunks upcasts fp16 -> fp32 in bounded batches rather than all at once: a single
+`vecs.astype(np.float32)` on the whole cache would eagerly materialise the full field in
+RAM (unlike a memmap, which the OS can page in incrementally), reintroducing the kind of
+RAM spike the disk format was chosen partly to avoid. _encode_pool's in-progress file is
+plain appended bytes, not a pre-sized memmap, specifically so a field that's 10% done
+only occupies 10% of its eventual disk footprint, not all of it up front; __init__ also
+evicts already-consumed sibling caches (any country, any field other than the one being
+processed) if free space runs low before starting the next field, trading resumability
+for the field that's already been used for feasibility of the one that hasn't.
 
 Text. Unlike ngram.py's character-3-gram fields, spaces are kept: a transformer tokenises
 into words/subwords, so gluing the name into one token (as the n-gram channel does for
@@ -102,6 +109,8 @@ def _model_slug(model_name: str) -> str:
 
 
 DISK_SAFETY_MARGIN = 2 * 1024**3  # headroom left for parquet/model/OS after a field's cache
+STORE_DTYPE = np.float16  # on-disk only; FAISS always gets float32 (see _add_in_chunks)
+BYTES_PER_DIM = np.dtype(STORE_DTYPE).itemsize
 
 
 class EmbeddingIndex:
@@ -133,13 +142,13 @@ class EmbeddingIndex:
                 log.info(f"{country} '{f}': loading cached embeddings from {cache.name}")
                 # Not a real .npy (no header) -- see _encode_pool's finalize step for why.
                 dim = self._get_dim()
-                expected = pool.height * dim * 4
+                expected = pool.height * dim * BYTES_PER_DIM
                 actual = cache.stat().st_size
                 assert actual == expected, (
                     f"{cache}: {actual} bytes on disk, expected {expected} for {pool.height:,} x {dim} "
-                    "float32 (stale cache from a different data version?)"
+                    f"{STORE_DTYPE.__name__} (stale cache from a different data version?)"
                 )
-                vecs = np.memmap(cache, dtype=np.float32, mode="r").reshape(pool.height, dim)
+                vecs = np.memmap(cache, dtype=STORE_DTYPE, mode="r").reshape(pool.height, dim)
             else:
                 self._make_room(pool.height, keep_stem=cache.stem)
                 with timed(log, f"{country}: encode '{f}' ({pool.height:,} records)"):
@@ -148,8 +157,8 @@ class EmbeddingIndex:
             if _IS_MACOS:
                 faiss.omp_set_num_threads(1)  # env var alone isn't always honoured; see note above
             idx = faiss.IndexFlatIP(vecs.shape[1])
-            idx.add(vecs)  # FAISS copies vecs into its own storage; we deliberately don't
-            self.index[f] = idx  # keep a second copy (see _reconstruct) -- that copy is what OOM'd
+            self._add_in_chunks(idx, vecs)  # FAISS always gets float32; vecs may be fp16 on disk
+            self.index[f] = idx
             log.info(f"{country} '{f}': {vecs.shape[0]:,} vectors, dim {vecs.shape[1]}")
             del vecs
 
@@ -158,6 +167,21 @@ class EmbeddingIndex:
             self._dim = (self.model.get_embedding_dimension if hasattr(self.model, "get_embedding_dimension")
                          else self.model.get_sentence_embedding_dimension)()
         return self._dim
+
+    @staticmethod
+    def _add_in_chunks(idx, vecs: np.ndarray, chunk: int = 500_000) -> None:
+        """Adds to a FAISS index in bounded batches, upcasting fp16 -> fp32 per batch.
+
+        `vecs` may be an fp16 memmap of a multi-GB on-disk cache. A single
+        `vecs.astype(np.float32)` call over the whole thing would eagerly materialise the
+        entire field in RAM (a memmap lets the OS page it in incrementally as FAISS's own
+        `add()` reads through it; `.astype()` does not), reintroducing the kind of RAM
+        spike the fp16 disk format was chosen partly to avoid. FAISS's own internal
+        storage ends up plain float32 either way -- this only bounds the *conversion*.
+        """
+        for s in range(0, vecs.shape[0], chunk):
+            e = min(s + chunk, vecs.shape[0])
+            idx.add(np.ascontiguousarray(vecs[s:e], dtype=np.float32))
 
     def _make_room(self, n_rows: int, keep_stem: str) -> None:
         """Evicts already-finished caches AND abandoned in-progress partials for this
@@ -187,7 +211,7 @@ class EmbeddingIndex:
             The two are only actually distinguishable at all by `keep_stem`: whatever
             field this specific call is about to encode.
         """
-        needed = n_rows * self._get_dim() * 4 + DISK_SAFETY_MARGIN
+        needed = n_rows * self._get_dim() * BYTES_PER_DIM + DISK_SAFETY_MARGIN
         free = shutil.disk_usage(WORK).free
         if free >= needed:
             return
@@ -232,13 +256,18 @@ class EmbeddingIndex:
 
         The finished file is the completed ".partial.raw" itself, just renamed -- not
         wrapped in a real .npy (no header). A rename is instant and needs no extra disk;
-        the previous version instead streamed a header+copy into a *second* full-size
-        file before deleting the source, which needs the completed raw file (its full
-        ~15GB) AND the growing copy to coexist simultaneously -- exactly what crashed a
-        real run right as a field finished encoding, immediately after eviction had freed
-        just enough room for the raw file alone. n/dim are always known independently
-        (pool size, model dimension) at load time, so no embedded shape metadata is
-        needed; callers reshape a plain memmap themselves.
+        an earlier version instead streamed a header+copy into a *second* full-size file
+        before deleting the source, which needs the completed raw file AND the growing
+        copy to coexist simultaneously -- exactly what crashed a real run right as a field
+        finished encoding, immediately after eviction had freed just enough room for the
+        raw file alone. n/dim are always known independently (pool size, model dimension)
+        at load time, so no embedded shape metadata is needed; callers reshape a plain
+        memmap themselves.
+
+        Bytes on disk are STORE_DTYPE (float16), not the float32 _encode() itself returns
+        -- halves the footprint at the one place it matters (persistent storage); FAISS
+        still gets float32 (see _add_in_chunks), so this costs one bounded rounding step,
+        not ongoing precision in search/scoring.
         """
         n, dim = len(texts), self._get_dim()
         progress = cache.with_name(cache.stem + ".progress.json")
@@ -248,14 +277,14 @@ class EmbeddingIndex:
         if progress.exists() and raw.exists():
             state = json.loads(progress.read_text())
             if (state.get("n") == n and state.get("dim") == dim
-                    and raw.stat().st_size >= state["done"] * dim * 4):
+                    and raw.stat().st_size >= state["done"] * dim * BYTES_PER_DIM):
                 done = state["done"]
                 log.info(f"{cache.stem}: resuming from checkpoint {done:,}/{n:,} ({100 * done / max(n, 1):.0f}%)")
             else:
                 log.info(f"{cache.stem}: stale/short checkpoint -- restarting from 0")
         if done:
             with open(raw, "r+b") as f:
-                f.truncate(done * dim * 4)  # drop any partial trailing write from a crash mid-chunk
+                f.truncate(done * dim * BYTES_PER_DIM)  # drop any partial trailing write from a crash mid-chunk
         else:
             raw.unlink(missing_ok=True)
 
@@ -265,7 +294,7 @@ class EmbeddingIndex:
         with open(raw, "ab" if done else "wb") as f:
             for s in range(done, n, chunk):
                 e = min(s + chunk, n)
-                f.write(self._encode(texts[s:e]).tobytes())
+                f.write(self._encode(texts[s:e]).astype(STORE_DTYPE).tobytes())
                 f.flush()
                 os.fsync(f.fileno())
                 done = e
@@ -285,7 +314,7 @@ class EmbeddingIndex:
 
         raw.rename(cache)
         progress.unlink(missing_ok=True)
-        return np.memmap(cache, dtype=np.float32, mode="r").reshape(n, dim)
+        return np.memmap(cache, dtype=STORE_DTYPE, mode="r").reshape(n, dim)
 
     def _queries(self, q_ids: pl.Series) -> pl.DataFrame:
         return (
