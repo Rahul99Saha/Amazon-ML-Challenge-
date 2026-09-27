@@ -122,7 +122,8 @@ class EmbeddingIndex:
         )
         self.p_ids = pool["idx"].to_numpy()
         self.p_row = pl.DataFrame({"p_idx": pool["idx"], "p_row": np.arange(pool.height, dtype=np.int64)})
-        self.index = {}
+        self.pool_height = pool.height
+        self.cache_paths = {}
         log.info(f"{country}: {pool.height:,} pool records, fields {self.fields}, model {model_name}")
         ctry_slug = country.replace(" ", "_")
 
@@ -133,6 +134,7 @@ class EmbeddingIndex:
             # in memory, so a crashed/killed/disconnected session loses all of it. Caching
             # each finished field to disk means a restart resumes instead of re-encoding.
             cache = WORK / f"emb_{model_slug}_{split}_{ctry_slug}_{f}.npy"
+            self.cache_paths[f] = cache
             if cache.exists():
                 log.info(f"{country} '{f}': loading cached embeddings from {cache.name}")
                 # Not a real .npy (no header) -- see _encode_pool's finalize step for why.
@@ -143,19 +145,10 @@ class EmbeddingIndex:
                     f"{cache}: {actual} bytes on disk, expected {expected} for {pool.height:,} x {dim} "
                     f"{STORE_DTYPE.__name__} (stale cache from a different data version?)"
                 )
-                vecs = np.memmap(cache, dtype=STORE_DTYPE, mode="r").reshape(pool.height, dim)
             else:
                 self._make_room(pool.height, keep_stem=cache.stem)
                 with timed(log, f"{country}: encode '{f}' ({pool.height:,} records)"):
-                    vecs = self._encode_pool(pool[f].to_list(), cache)
-            import faiss
-            if _IS_MACOS:
-                faiss.omp_set_num_threads(1)  # env var alone isn't always honoured; see note above
-            idx = faiss.IndexFlatIP(vecs.shape[1])
-            self._add_in_chunks(idx, vecs)  # FAISS always gets float32; vecs may be fp16 on disk
-            self.index[f] = idx
-            log.info(f"{country} '{f}': {vecs.shape[0]:,} vectors, dim {vecs.shape[1]}")
-            del vecs
+                    self._encode_pool(pool[f].to_list(), cache)
 
     def _get_dim(self) -> int:
         if self._dim is None:
@@ -305,11 +298,21 @@ class EmbeddingIndex:
 
     def topk(self, q_ids: pl.Series, top_k: int = 50, min_score: float = 0.5) -> pl.DataFrame:
         """(q_idx, p_idx) for the union over fields of each query's top-k neighbours by cosine sim."""
+        import faiss
+        import gc
+        if _IS_MACOS:
+            faiss.omp_set_num_threads(1)
+        dim = self._get_dim()
         q = self._queries(q_ids)
         outs = []
         for f in self.fields:
             Qv = self._encode(q[f].to_list())
-            sims, cols = self.index[f].search(Qv, top_k)
+            vecs = np.memmap(self.cache_paths[f], dtype=STORE_DTYPE, mode="r").reshape(self.pool_height, dim)
+            idx = faiss.IndexFlatIP(dim)
+            self._add_in_chunks(idx, vecs)
+            sims, cols = idx.search(Qv, top_k)
+            del idx, vecs
+            gc.collect()
             rows = np.repeat(np.arange(len(q)), top_k)
             cols, sims = cols.ravel(), sims.ravel()
             keep = (cols >= 0) & (sims >= min_score)
@@ -318,12 +321,9 @@ class EmbeddingIndex:
         return pl.concat(outs).unique()
 
     def _reconstruct(self, f: str, rows: np.ndarray) -> np.ndarray:
-        """Pulls specific pool vectors back out of the FAISS index (see __init__: we don't
-        keep a second copy of the full pool matrix around just for this)."""
-        idx = self.index[f]
-        if hasattr(idx, "reconstruct_batch"):
-            return idx.reconstruct_batch(rows.astype(np.int64))
-        return np.stack([idx.reconstruct(int(i)) for i in rows])
+        """Pulls specific pool vectors directly from the on-disk memmap (zero persistent RAM overhead)."""
+        mmap = np.memmap(self.cache_paths[f], dtype=STORE_DTYPE, mode="r").reshape(self.pool_height, self._get_dim())
+        return np.ascontiguousarray(mmap[rows], dtype=np.float32)
 
     def pair_features(self, pairs: pl.DataFrame) -> pl.DataFrame:
         """Adds emb_<field> cosine score and emb_<field>_rank (within query) for every pair."""
